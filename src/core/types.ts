@@ -26,6 +26,13 @@ export interface Sentence {
   lineCount: number;
   /** 可选译文（按时间区间重叠匹配） */
   translation?: string;
+  /**
+   * 该句的 startMs/endMs 是否来自**用户手工修正**（见 core/timing.ts）。
+   *
+   * 这里放的是「生效值」（已应用修正），原始值仍留在 material.json 里 ——
+   * 「复原」就是把修正层里那条删掉。UI 据此显示 ✎ 标记与「复原本句」。
+   */
+  timingEdited?: boolean;
 }
 
 export type MaterialSource = 'ted' | 'youtube' | 'podcast' | 'local';

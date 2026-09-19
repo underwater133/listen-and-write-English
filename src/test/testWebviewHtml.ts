@@ -29,9 +29,11 @@ function check(name: string, ok: boolean, detail?: string): void {
 
 const panelPath = path.join(__dirname, '../../src/webview/panel.ts');
 const sidebarPath = path.join(__dirname, '../../src/webview/sidebar.ts');
+const timingPath = path.join(__dirname, '../../src/core/timing.ts');
 
 const panel = fs.readFileSync(panelPath, 'utf8');
 const sidebar = fs.readFileSync(sidebarPath, 'utf8');
+const timingSrc = fs.readFileSync(timingPath, 'utf8');
 
 console.log('=== webview HTML 生成器自检 ===\n');
 
@@ -324,12 +326,121 @@ check(
   /type: 'talkInfo'/.test(panel) && /case 'talkInfo'/.test(panel)
 );
 
+// 视图导航：**点哪个去哪个（幂等）**，不做「再点一次回练习」的 toggle。
+// 真实事故（2026-09-19）：原来两个按钮都写成 toggle，连点两下「发现 TED」
+// 就在列表与精听界面之间来回跳，用户反馈「界面跳来跳去、停不下来」。
+check(
+  'panel.ts: 顶部有 3 个导航按钮（发现 TED / 素材库 / 诊断报告）',
+  /id="discoverBtn"/.test(panel) &&
+    /id="libraryBtn"/.test(panel) &&
+    /id="report"/.test(panel),
+  '缺少导航按钮'
+);
+// 设计决策（2026-09-19）：导航栏刻意不放「练习」。
+// 回精听界面只能从「素材库」点一篇素材（或发现列表里点已下载卡片的「练习」）——
+// 这两个入口都会真的去加载素材，不会留下"空转的练习界面"。
+check(
+  'panel.ts: 导航栏不含「练习」按钮（进练习只能从素材库选素材）',
+  !/id="practiceBtn"/.test(panel) && !/navBtn\.practice/.test(panel),
+  '又加回了「练习」导航按钮'
+);
+check(
+  'panel.ts: 导航按钮只切换、不做 toggle',
+  /navBtn\.discover\.onclick/.test(panel) &&
+    /navBtn\.library\.onclick/.test(panel) &&
+    !/currentView === '(discover|library)'\) \{ showView\('practice'\)/.test(panel),
+  '导航又写成 toggle 了：连点同一个按钮会在两个界面之间来回跳'
+);
+check(
+  'panel.ts: 当前视图的导航按钮高亮（.topbar button.on）',
+  /\.topbar button\.on \{/.test(panel) &&
+    /classList\.toggle\('on', k === name\)/.test(panel),
+  '没有高亮当前视图，用户看不出自己在哪个界面'
+);
+// 首屏也要有高亮：历史 bug —— 高亮只在 showView() 里更新，
+// 而首屏从未调用它，刚打开时三个按钮全是灰的。
+check(
+  'panel.ts: 首屏就初始化当前视图高亮',
+  /showView\(currentView\)/.test(panel),
+  '首屏没有初始化高亮，刚打开时看不出自己在哪个界面'
+);
+
+/* ---------- 逐句时间轴微调（2026-09-19） ----------
+ *
+ * 背景：TED 的 VTT 是「粗对齐」，同一篇里各句误差不一致（有的准、有的偏几百
+ * 毫秒），全局偏移量修不了 —— 只能让用户在听到对不上时就地微调那一句。
+ *
+ * 下面每条挂了都不是小事：
+ *   - 修正必须单独落 timing.json，绝不回写 material.json ——
+ *     原始时间轴是「复原」的唯一基准，而且 material.json 会被
+ *     clampSentencesToAudio / 缓存重建等路径重写，混在一起会被冲掉。
+ *   - 必须能复原本句与全部，否则改错了就回不去。
+ *   - 改完要自动重播：判断依据只有耳朵，不即时回放等于闭着眼调。
+ *   - 不做打点按钮、不做试听按钮（2026-09-19 明确：打点有人耳延迟必然不准；
+ *     试听由「改完自动重播 + 已有的播放按钮」覆盖）。
+ */
+check(
+  'panel.ts: 有逐句时间轴微调入口（timingHtml / #timingHead）',
+  /function timingHtml/.test(panel) && /id="timingHead"/.test(panel),
+  '缺少时间轴微调入口'
+);
+check(
+  'panel.ts: 微调经 setTiming 通道落盘',
+  /type: 'setTiming'/.test(panel) && /case 'setTiming'/.test(panel),
+  '缺少保存通道'
+);
+check(
+  'panel.ts: 提供复原本句 / 复原全部',
+  /type: 'resetTiming'/.test(panel) &&
+    /type: 'resetAllTiming'/.test(panel) &&
+    /case 'resetTiming'/.test(panel) &&
+    /case 'resetAllTiming'/.test(panel),
+  '缺少复原通道：改错了就回不去'
+);
+check(
+  'panel.ts: 调整后自动重播（带防抖，连点只播一次）',
+  /function scheduleTimingPreview/.test(panel) &&
+    /clearTimeout\(timingPreviewTimer\)/.test(panel),
+  '调完不重播等于闭着眼调'
+);
+check(
+  'panel.ts: 微调条不打点、不设试听按钮',
+  !/class="t-set"/.test(panel) && !/id="tPlay"/.test(panel),
+  '又加回了打点 / 试听按钮（已明确不要）'
+);
+check(
+  'panel.ts: 加载素材时合并修正层（applyTimingOverrides）',
+  /applyTimingOverrides\(/.test(panel),
+  '没有应用修正层，改了也不会生效'
+);
+check(
+  'panel.ts: 保存前校验时间轴（起止不倒挂 / 不越界）',
+  /normalizeTiming/.test(panel) && /endMs - startMs < 100/.test(panel),
+  '没有校验：越界值会让 seek 落空，表现为「点了播放没反应」'
+);
+check(
+  '★ timing.ts: 不修改入参数组（原始时间轴只读，复原才有依据）',
+  /return \{ \.\.\.s, startMs, endMs, timingEdited: true \}/.test(timingSrc),
+  '若就地改写原始值，复原将不再可能'
+);
+check(
+  'timing.ts: 坏 timing.json 退化为「无修正」而不是抛错',
+  /catch \{[\s\S]{0,120}return \{\};/.test(timingSrc),
+  '坏文件不能让素材打不开'
+);
+check(
+  'timing.ts: 复原全部会删掉文件（不留空壳 timing.json）',
+  /unlinkSync/.test(timingSrc),
+  '「复原全部」应让素材目录回到干净状态'
+);
+
 // 布局切换
 check('panel.ts: 顶部有布局切换按钮 #layoutBtn', /id="layoutBtn"/.test(panel));
 check('panel.ts: 布局按钮有点击绑定', /layoutBtn\.onclick/.test(panel));
 check(
   'panel.ts: 布局按钮只在精听界面显示',
-  /function updateLayoutBtn/.test(panel) && /currentView === 'practice' && !reportMode/.test(panel),
+  /function updateLayoutBtn/.test(panel) &&
+    /currentView === 'practice' \? '' : 'none'/.test(panel),
   '布局按钮的显隐没有跟视图绑定'
 );
 check('panel.ts: 有上下布局样式 .main.stacked', /\.main\.stacked \{/.test(panel));
@@ -381,6 +492,20 @@ check(
 check(
   'panel.ts: 布局选择会持久化（setState/getState）',
   /vscode\.setState/.test(panel) && /vscode\.getState/.test(panel)
+);
+
+// ★ 诊断报告必须是独立视图，不能写进 #root（练习界面）。
+// 真实事故（2026-09-19）：报告写进 #root 且不切视图 ——
+//   在「发现 TED」/「素材库」里点诊断报告没有任何反应（内容进了隐藏容器），
+//   而之后任何一次"切回练习"都会突然显示那份报告，
+//   表现为「界面跳来跳去、跳到诊断报告去了」。
+check(
+  'panel.ts: 诊断报告是独立视图（不写进 #root）',
+  /id="reportView"/.test(panel) &&
+    /report: reportView/.test(panel) &&
+    /reportView\.innerHTML/.test(panel) &&
+    !/reportMode/.test(panel),
+  '报告又写回 #root 了：会污染练习界面，切视图时莫名显示报告'
 );
 
 check('panel.ts: 含 <audio id="player">', /<audio id="player"/.test(panel));

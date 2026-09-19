@@ -24,6 +24,14 @@ import * as path from 'path';
 import { ListeningMaterial, MaterialSourceAdapter, AudioInfo, AudioProgress, relocateAudioPath, clampSentencesToAudio, extractNextDataJson, TedNextData, AUDIO_CACHE_VERSION } from '../core/types';
 import { httpGetText } from '../core/http';
 import { checkSentence, SentenceResult, buildReport } from '../core/diff';
+import {
+  applyTimingOverrides,
+  clearAllTimingOverrides,
+  clearTimingOverride,
+  readTimingOverrides,
+  setTimingOverride,
+  SentenceTiming,
+} from '../core/timing';
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
 import { MistakeStore, trace } from '../extension';
@@ -697,6 +705,94 @@ export class PracticePanel {
         }
         break;
       }
+
+      /* ---------------- 逐句时间轴修正（见 core/timing.ts） ----------------
+       * 只写 timing.json 覆盖层，material.json 里的原始时间轴永不改写，
+       * 因此「复原」在任何时候都可用。
+       */
+      case 'setTiming': {
+        const dir = this.material?.cacheDir;
+        const idx = Number(msg.index);
+        const orig = this.material?.sentences[idx];
+        if (!dir || !orig) break;
+        const v = this.normalizeTiming(msg.startMs, msg.endMs);
+        if (!v) {
+          this.webview.postMessage({
+            type: 'timingError',
+            message: '时间轴不合法：起点要小于终点，且都要落在 0 到音频长度之间。',
+          });
+          break;
+        }
+        try {
+          // 改回原值就当成「复原」—— 否则会留下一条"改了、但值和原来一样"的
+          // 假修正，UI 一直显示 ✎ 而用户看不出哪里不同。
+          const backToOrig =
+            Math.round(orig.startMs) === v.startMs && Math.round(orig.endMs) === v.endMs;
+          const ov = backToOrig
+            ? clearTimingOverride(dir, idx)
+            : setTimingOverride(dir, idx, v);
+          this.webview.postMessage({
+            type: 'timingPatched',
+            index: idx,
+            startMs: backToOrig ? Math.round(orig.startMs) : v.startMs,
+            endMs: backToOrig ? Math.round(orig.endMs) : v.endMs,
+            edited: !backToOrig,
+            count: Object.keys(ov).length,
+          });
+        } catch (e: any) {
+          this.webview.postMessage({
+            type: 'timingError',
+            message: '保存时间轴修正失败：' + String(e?.message ?? e),
+          });
+        }
+        break;
+      }
+
+      case 'resetTiming': {
+        const dir = this.material?.cacheDir;
+        const idx = Number(msg.index);
+        const orig = this.material?.sentences[idx];
+        if (!dir || !orig) break;
+        try {
+          const ov = clearTimingOverride(dir, idx);
+          this.webview.postMessage({
+            type: 'timingPatched',
+            index: idx,
+            startMs: orig.startMs,
+            endMs: orig.endMs,
+            edited: false,
+            count: Object.keys(ov).length,
+          });
+        } catch (e: any) {
+          this.webview.postMessage({
+            type: 'timingError',
+            message: '复原失败：' + String(e?.message ?? e),
+          });
+        }
+        break;
+      }
+
+      case 'resetAllTiming': {
+        const dir = this.material?.cacheDir;
+        if (!dir || !this.material) break;
+        try {
+          clearAllTimingOverrides(dir);
+          // ⚠️ 全量回推 sentences，但【不能】用 pushMaterial()：
+          //    页面收到 'material' 会把 currentIndex 重置为 0，等于把用户
+          //    正在练的句子踢回第一句。这里只换时间轴，不动进度。
+          this.webview.postMessage({
+            type: 'timingReset',
+            sentences: this.material.sentences,
+            count: 0,
+          });
+        } catch (e: any) {
+          this.webview.postMessage({
+            type: 'timingError',
+            message: '复原全部失败：' + String(e?.message ?? e),
+          });
+        }
+        break;
+      }
     }
   }
 
@@ -852,6 +948,23 @@ export class PracticePanel {
 
   private pushMaterial(): void {
     if (!this.material) return;
+
+    /**
+     * 应用用户的逐句时间轴修正。
+     *
+     * ⚠️ 只在推送时合并，**不回写 material.json**：
+     *    原始时间轴是「复原」的唯一基准，一旦被就地改写就回不去了。
+     *    详见 core/timing.ts 开头的设计说明。
+     */
+    const overrides = readTimingOverrides(this.material.cacheDir);
+    const sentences = applyTimingOverrides(
+      this.material.sentences,
+      overrides,
+      this.material.audio?.durationMs
+    );
+    // 实际生效的条数（越界被丢弃的不算），页面据此决定要不要显示「复原全部」
+    const timingCount = sentences.filter((s) => s.timingEdited).length;
+
     // 【现场取证】把推给 webview 的关键字段打进输出通道。
     // 排查「点击播放没反应」时，第一件事就是确认 audioUri 到底是什么。
     trace('[LT-TRACE] pushMaterial:');
@@ -863,6 +976,7 @@ export class PracticePanel {
     trace('[LT-TRACE]   rawPath   = ' + this.material.audio?.path);
     trace('[LT-TRACE]   format    = ' + this.material.audio?.format +
       '  (v3 起应为 m4a/MP4；aac=裸 ADTS 在 VS Code 里播不了)');
+    trace('[LT-TRACE]   timing    = ' + timingCount + ' 句有手工修正');
 
     this.webview.postMessage({
       type: 'material',
@@ -870,7 +984,9 @@ export class PracticePanel {
         id: this.material.id,
         title: this.material.title,
         presenter: this.material.presenter,
-        sentences: this.material.sentences,
+        sentences: sentences,
+        // 已有修正的句数：页面据此决定要不要显示「复原全部」
+        timingCount: timingCount,
         audioUri: this.audioUri,
         durationMs: this.material.audio?.durationMs,
         startOffsetMs: this.material.audio?.startOffsetMs ?? 0,
@@ -879,6 +995,24 @@ export class PracticePanel {
         audioFormat: this.material.audio?.format ?? null,
       },
     });
+  }
+
+  /**
+   * 校验并规整用户提交的句子时间轴。返回 null = 不合法，直接拒绝。
+   *
+   * 为什么必须校验而不是照单全收：越界的 start/end 会让 seek 落在不存在的
+   * 区间，播放器静默不动作 —— 表现为「点了播放没反应」，比偏一点更难排查。
+   */
+  private normalizeTiming(startRaw: unknown, endRaw: unknown): SentenceTiming | null {
+    const startMs = Math.round(Number(startRaw));
+    const endMs = Math.round(Number(endRaw));
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+    if (startMs < 0) return null;
+    // 至少留 100ms：防止滑出"零长度句"（永远播不出声）
+    if (endMs - startMs < 100) return null;
+    const dur = this.material?.audio?.durationMs;
+    if (typeof dur === 'number' && dur > 0 && endMs > dur) return null;
+    return { startMs, endMs };
   }
 
   /* ---------------- HTML ---------------- */
@@ -986,6 +1120,10 @@ export class PracticePanel {
   button:hover { opacity: .9; }
   button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
   button:disabled { opacity: .5; cursor: default; }
+  /* 当前所在视图的导航按钮。
+   * ⚠️ 只改颜色/边框色，绝不改尺寸或显隐 —— 否则按钮会位移，
+   *    用户按原位置再点一下就会点到别的按钮。 */
+  .topbar button.on { color: var(--accent); border-color: var(--accent); }
 
   .meta { padding: 8px 12px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
   .meta h2 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
@@ -1150,6 +1288,14 @@ export class PracticePanel {
   /* ---- 「素材库」视图（已缓存素材）---- */
   .library { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
   .library.visible { display: flex; }
+
+  /* ---- 「诊断报告」视图 ----
+   * ⚠️ 报告必须是独立视图，不能写进 #root（练习界面）：
+   *    历史事故（2026-09-19）——报告写进 #root 且不切视图，于是在「发现 TED」/
+   *    「素材库」里点诊断报告没有任何反应（写进了隐藏容器），而之后任何一次
+   *    "切回练习"都会突然显示那份报告，表现为「界面跳来跳去、跳到诊断报告去了」。 */
+  .report-view { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
+  .report-view.visible { display: flex; }
   .lib-card {
     padding: 8px; margin-bottom: 6px;
     border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
@@ -1168,6 +1314,24 @@ export class PracticePanel {
   }
   .badge.ok { color: var(--ok); border: 1px solid currentColor; }
   .badge.no { color: var(--muted); border: 1px dashed currentColor; }
+
+  /* ---- 逐句时间轴微调条 ----
+   * 折叠态只有一行标题，展开后是两行 ± 与一行操作。
+   * 按钮一律 flex: 0 0 auto + 允许换行：侧边栏很窄，宁可换行也不能被压扁。 */
+  .timing { padding: 4px 12px 6px; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+  .timing-head {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: var(--muted); cursor: pointer;
+  }
+  .timing-head:hover { color: var(--fg); }
+  .timing-head .t-now {
+    margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted);
+  }
+  .timing-body { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .t-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .t-row button { flex: 0 0 auto; padding: 2px 6px; font-size: 11px; line-height: 1.5; }
+  .t-lbl { min-width: 26px; color: var(--muted); font-size: 11px; }
+  .t-mark { color: var(--accent); font-size: 10px; margin-left: 4px; }
   .lib-card.selected { border-color: var(--accent); background: rgba(128,128,128,.08); }
   .lib-card > div { flex: 1 1 auto; min-width: 0; }
   .lib-del {
@@ -1182,6 +1346,10 @@ export class PracticePanel {
 <body>
 
 <div class="topbar">
+  <!-- 导航按钮：点哪个去哪个（幂等，不做「再点一次回练习」），当前视图高亮。
+       这里刻意【没有】「练习」按钮 —— 回精听界面只有一条路：
+       在「素材库」里点一篇素材（或在发现列表点已下载卡片的「练习」），
+       这样不会出现"切回练习界面却什么都没加载"的空转状态。 -->
   <button id="discoverBtn" class="ghost">发现 TED</button>
   <button id="libraryBtn" class="ghost">素材库</button>
   <button id="report" class="ghost">诊断报告</button>
@@ -1214,6 +1382,8 @@ export class PracticePanel {
   <div id="discList"></div>
   <div class="disc-foot" id="discFoot"></div>
 </div>
+
+<div id="reportView" class="report-view"></div>
 
 <div id="library" class="library">
   <div class="disc-bar" id="libBar"></div>
@@ -1294,6 +1464,11 @@ let state = {
   listCollapsed: false,
   // 布局：false = 左字幕 / 右操作（默认）；true = 上操作 / 下字幕
   stacked: false,
+  // 时间轴微调面板是否展开（只在会话内记忆，不持久化）
+  timingOpen: false,
+  // 当前素材已手工修正的句数 —— 宿主在 material / timingPatched 里告知，
+  // 决定「复原全部」要不要出现
+  timingCount: 0,
 };
 
 // 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
@@ -1323,7 +1498,31 @@ document.getElementById('report').onclick = () => vscode.postMessage({ type: 're
 
 window.addEventListener('message', (e) => {
   const msg = e.data;
-  if (msg.type === 'material') { state.material = msg.material; state.currentIndex = 0; render(); }
+  if (msg.type === 'material') {
+    state.material = msg.material;
+    state.currentIndex = 0;
+    state.timingCount = msg.material.timingCount || 0;
+    render();
+  }
+  // 时间轴修正的保存结果。宿主是唯一权威：一律以回推值为准，
+  // 不做"本地改了就当成功"——保存失败（目录只读等）时页面必须纠回来。
+  if (msg.type === 'timingPatched') {
+    const s = state.material && state.material.sentences[msg.index];
+    if (s) {
+      s.startMs = msg.startMs;
+      s.endMs = msg.endMs;
+      s.timingEdited = !!msg.edited;
+    }
+    state.timingCount = msg.count || 0;
+    render();
+  }
+  // 「复原全部」：只换时间轴，保持当前句不变
+  if (msg.type === 'timingReset') {
+    if (state.material) state.material.sentences = msg.sentences;
+    state.timingCount = msg.count || 0;
+    render();
+  }
+  if (msg.type === 'timingError') showPlayerError(msg.message);
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
   // ★ 下载来源区分（2026-09-19）：
   //   - 「发现 TED」列表里点「下载」→ 进度/错误只更新那张卡片，页面留在列表
@@ -1408,21 +1607,30 @@ let discState = {
   download: {},
 };
 
-/* 三视图统一切换：practice / discover / library 互斥显示 */
+/* 四视图统一切换：practice / discover / library / report 互斥显示 */
+const reportView = document.getElementById('reportView');
 const viewEls = {
   practice: document.getElementById('root'),
   discover: discView,
   library: libView,
+  report: reportView,
 };
 let currentView = 'practice';
-// 诊断报告会占用 #root，但它不算「精听界面」——布局按钮此时要藏起来
-let reportMode = false;
+
+/* 顶部导航按钮 ↔ 视图的对应关系（用于给当前视图的按钮加高亮）。
+ * ⚠️ 不含 practice：精听界面不是导航项，进练习只能从素材库选一篇素材。
+ *    因此处在练习界面时三个导航按钮都不高亮（等于「不在任何 tab 里」）。 */
+const navBtn = {
+  discover: document.getElementById('discoverBtn'),
+  library: document.getElementById('libraryBtn'),
+  report: document.getElementById('report'),
+};
 
 const layoutBtn = document.getElementById('layoutBtn');
 
 /** 布局按钮：只在精听界面显示，文案写「点了会切到哪种布局」 */
 function updateLayoutBtn() {
-  layoutBtn.style.display = currentView === 'practice' && !reportMode ? '' : 'none';
+  layoutBtn.style.display = currentView === 'practice' ? '' : 'none';
   layoutBtn.textContent = state.stacked ? '⇄ 左右布局' : '⇅ 上下布局';
 }
 
@@ -1431,9 +1639,18 @@ function showView(name) {
   for (const k of Object.keys(viewEls)) {
     viewEls[k].classList.toggle('visible', k === name);
   }
+  // 高亮「我现在在哪个视图」。只切 class，不碰样式尺寸（见 .topbar button.on 注释）
+  for (const k of Object.keys(navBtn)) {
+    navBtn[k].classList.toggle('on', k === name);
+  }
   updateLayoutBtn();
 }
 function showPracticeView() { showView('practice'); }
+
+/* 首屏：立刻按初始视图刷一遍高亮与布局按钮。
+ * 历史 bug（2026-09-19）：高亮只在 showView() 里更新，而首屏从未调用过它 ——
+ *   刚打开时三个导航按钮全是灰的，看不出自己处在哪个界面。 */
+showView(currentView);
 
 layoutBtn.onclick = () => {
   state.stacked = !state.stacked;
@@ -1441,14 +1658,24 @@ layoutBtn.onclick = () => {
   render();
 };
 
-document.getElementById('discoverBtn').onclick = () => {
-  if (currentView === 'discover') { showView('practice'); return; }
+/* ---------------- 顶部导航 ----------------
+ * ⚠️ 一律「切过去」并保持，**不做「再点一次就回练习」的 toggle**。
+ *    历史事故（2026-09-19）：原来写成 toggle，连点两下「发现 TED」就会在
+ *    列表与精听界面之间来回跳，用户反馈「界面跳来跳去、停不下来」。
+ *    另：已经在目标视图时直接 return，避免重复请求接口导致列表闪烁。
+ *
+ * 回精听界面不走导航栏（栏里没有「练习」）：
+ *   只能从「素材库」点一篇素材，或在发现列表点已下载卡片的「练习」——
+ *   这两个入口都会真的去加载素材，不会留下"空转的练习界面"。
+ */
+navBtn.discover.onclick = () => {
+  if (currentView === 'discover') return;
   showView('discover');
   if (!discList.children.length) discLoad(0);
 };
 
-document.getElementById('libraryBtn').onclick = () => {
-  if (currentView === 'library') { showView('practice'); return; }
+navBtn.library.onclick = () => {
+  if (currentView === 'library') return;
   showView('library');
   libMeta.textContent = '读取中…';
   libList.innerHTML = '';
@@ -1864,7 +2091,6 @@ function render() {
     render();
   };
 
-  reportMode = false;   // 这一函数画的就是精听界面
   updateLayoutBtn();
 }
 
@@ -1875,9 +2101,13 @@ function renderList() {
     const r = state.results[i];
     const mark = r ? (r.correct ? '<span style="color:var(--ok)">✓</span>'
                                : '<span style="color:var(--err)">✗</span>') : '';
+    // 时间轴被手工修过的句子打个标记，方便回头复查哪几句动过
+    const tMark = s.timingEdited
+      ? '<span class="t-mark" title="这一句的时间轴被手工修正过">✎</span>'
+      : '';
     return '<div class="item' + (i === state.currentIndex ? ' active' : '') + '" data-i="' + i + '">' +
       '<span class="idx">' + (i + 1) + '</span>' +
-      '<span class="txt">' + esc(s.text) + '</span>' +
+      '<span class="txt">' + esc(s.text) + tMark + '</span>' +
       '<span class="idx">' + mark + '</span>' +
     '</div>';
   }).join('');
@@ -1892,6 +2122,114 @@ function renderList() {
 
   const active = list.querySelector('.item.active');
   if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+/* ---------------- 逐句时间轴微调 ----------------
+ *
+ * 背景：TED 的 VTT 是「粗对齐」的，同一篇里有的句子很准、有的偏几百毫秒，
+ * 这是字幕本身的问题，全局偏移量修不了。用户在听到某句对不上时，需要能
+ * 就地微调这一句 —— 修正只写覆盖层（timing.json），原始时间轴不动，
+ * 所以随时可以复原。详见 core/timing.ts 开头的设计说明。
+ */
+
+// 试听防抖句柄：连点 ± 时不能每一下都播（会变成噪音），停手后只播一次
+let timingPreviewTimer = null;
+
+/**
+ * 毫秒级时间显示（形如 0:12.340）。
+ * ⚠️ 不要用 fmtTime —— 它只到秒，微调时看不到毫秒等于闭着眼调。
+ */
+function fmtMs(ms) {
+  if (ms == null) return '--:--';
+  const t = Math.max(0, Math.round(ms));
+  return Math.floor(t / 60000) + ':' +
+    String(Math.floor((t % 60000) / 1000)).padStart(2, '0') + '.' +
+    String(t % 1000).padStart(3, '0');
+}
+
+/**
+ * 时间轴微调条。
+ *
+ * 折叠态只占一行 —— 时间轴不是每句都要调，长期展开会把听写区挤没。
+ * 展开后只有起点/终点两组 ±（1s 粗调 + 0.1s 精调），外加复原。
+ *
+ * 刻意【不做】的两种按钮（2026-09-19 明确）：
+ *   - 打点（把当前位置设为起点/终点）：人耳反应有 100~200ms 延迟，落点
+ *     必然不准，还得靠 ±.1s 修，不如直接给 ± 省掉一个按钮。
+ *   - 试听：调整后本来就会自动重播（见 scheduleTimingPreview），
+ *     想再听一遍点已有的「播放 / 重播」即可。
+ */
+function timingHtml(s) {
+  const head =
+    '<div class="timing-head" id="timingHead" title="听到对不上的句子，点这里微调它的起止时间（改完会自动重播）">' +
+      '<span>' + (state.timingOpen ? '▾' : '▸') + ' 时间轴微调</span>' +
+      (s.timingEdited ? '<span class="badge ok">已修正</span>' : '') +
+      '<span class="t-now">' + fmtMs(s.startMs) + '–' + fmtMs(s.endMs) + '</span>' +
+    '</div>';
+  if (!state.timingOpen) return '<div class="timing">' + head + '</div>';
+
+  const row = (kind, label) =>
+    '<div class="t-row">' +
+      '<span class="t-lbl">' + label + '</span>' +
+      '<button class="t-adj" data-k="' + kind + '" data-d="-1000" title="提前 1 秒">−1s</button>' +
+      '<button class="t-adj" data-k="' + kind + '" data-d="-100" title="提前 0.1 秒">−.1s</button>' +
+      '<button class="t-adj" data-k="' + kind + '" data-d="100" title="推后 0.1 秒">+.1s</button>' +
+      '<button class="t-adj" data-k="' + kind + '" data-d="1000" title="推后 1 秒">+1s</button>' +
+    '</div>';
+
+  // 没有可复原的东西时整行不渲染（不占位、不留空行）
+  const actions =
+    (s.timingEdited ? '<button id="tReset" class="ghost">↺ 复原本句</button>' : '') +
+    (state.timingCount > 0
+      ? '<button id="tResetAll" class="ghost">复原全部 (' + state.timingCount + ')</button>'
+      : '');
+
+  return '<div class="timing">' + head +
+    '<div class="timing-body">' +
+      row('start', '起点') +
+      row('end', '终点') +
+      (actions ? '<div class="t-row">' + actions + '</div>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+/** 调整完延后试听：连点 ± 时只播最后一次 */
+function scheduleTimingPreview() {
+  if (timingPreviewTimer) clearTimeout(timingPreviewTimer);
+  timingPreviewTimer = setTimeout(() => {
+    timingPreviewTimer = null;
+    playCurrent();
+  }, 300);
+}
+
+/**
+ * 微调当前句的起点/终点（单位毫秒）。
+ *
+ * ⚠️ 必须【本地先改】再发消息：宿主回包到达前若仍按旧值算，连点时中间
+ *    几次点击会被吞掉（表现为"点了不动"）。宿主回 timingPatched 后会以
+ *    回推值为准覆盖，所以本地乐观更新是安全的。
+ */
+function adjTiming(kind, delta) {
+  const m = state.material;
+  const s = m && m.sentences[state.currentIndex];
+  if (!s) return;
+  let startMs = s.startMs;
+  let endMs = s.endMs;
+  if (kind === 'start') startMs = Math.max(0, startMs + delta);
+  else endMs = endMs + delta;
+  // 至少留 100ms：滑成零长度句就永远播不出声，比偏一点更糟
+  if (endMs - startMs < 100) return;
+  if (m.durationMs && endMs > m.durationMs) return;
+  s.startMs = startMs;
+  s.endMs = endMs;
+  render();
+  vscode.postMessage({
+    type: 'setTiming',
+    index: state.currentIndex,
+    startMs: startMs,
+    endMs: endMs,
+  });
+  scheduleTimingPreview();
 }
 
 function renderPractice() {
@@ -1936,6 +2274,9 @@ function renderPractice() {
         ' · ' + fmtTime(s.startMs) + '–' + fmtTime(s.endMs) + '</span>' +
     '</div>' +
 
+    // 时间轴微调条（折叠态只占一行）
+    timingHtml(s) +
+
     '<div class="answer" id="diagBox" style="display:none">' +
       '<div class="lbl">音频加载诊断</div>' +
       '<div id="diagContent" class="hint" style="white-space:pre-wrap;font-size:11px"></div>' +
@@ -1959,6 +2300,27 @@ function renderPractice() {
     '</div>' +
 
     diffHtml;
+
+  /* 时间轴微调的交互绑定 */
+  const timingHeadEl = document.getElementById('timingHead');
+  if (timingHeadEl) {
+    timingHeadEl.onclick = () => {
+      state.timingOpen = !state.timingOpen;
+      render();
+    };
+  }
+  document.querySelectorAll('.t-adj').forEach((el) => {
+    el.onclick = () => adjTiming(el.dataset.k, Number(el.dataset.d));
+  });
+  const tResetBtn = document.getElementById('tReset');
+  if (tResetBtn) {
+    tResetBtn.onclick = () =>
+      vscode.postMessage({ type: 'resetTiming', index: state.currentIndex });
+  }
+  const tResetAllBtn = document.getElementById('tResetAll');
+  if (tResetAllBtn) {
+    tResetAllBtn.onclick = () => vscode.postMessage({ type: 'resetAllTiming' });
+  }
 
   document.getElementById('play').onclick = playCurrent;
   document.getElementById('replay').onclick = playCurrent;
@@ -2576,7 +2938,10 @@ function renderReport(rep) {
 
   const totalErr = entries.reduce((s, [, v]) => s + v, 0);
 
-  root.innerHTML =
+  // ⚠️ 写进独立的 #reportView，不要写 #root ——
+  //    写 #root 会污染练习界面：在发现/素材库视图下点「诊断报告」看不到反应
+  //    （内容进了隐藏容器），而之后任何一次切回练习都会突然显示报告。
+  reportView.innerHTML =
     '<div class="meta"><h2>听力诊断报告</h2>' +
     '<div class="sub">共 ' + rep.totalAttempts + ' 次练习 · ' + rep.totalSentences + ' 个句子 · ' +
     '累计错误 ' + totalErr + ' 处</div></div>' +
@@ -2609,12 +2974,12 @@ function renderReport(rep) {
       '<div style="margin-top:16px"><button id="back" class="ghost">返回练习</button></div>' +
     '</div>';
 
-  // 报告占用了 #root，但这不是精听界面 —— 布局按钮要收起来
-  reportMode = true;
-  updateLayoutBtn();
+  // 切到报告视图（布局按钮会自动隐藏：它只在精听界面出现）
+  showView('report');
 
+  // 「返回练习」只是切回练习视图 —— #root 里一直是练习界面，不需要重绘
   const back = document.getElementById('back');
-  if (back) back.onclick = render;
+  if (back) back.onclick = () => showView('practice');
 }
 
 vscode.postMessage({ type: 'ready' });
