@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>裸 AAC 播放路线验证</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; padding: 20px;
+         background: #1e1e1e; color: #ddd; line-height: 1.6; }
+  h2 { font-size: 15px; margin: 18px 0 8px; }
+  .row { padding: 10px; margin: 8px 0; border-radius: 4px; font-size: 13px;
+         background: #252526; border: 1px solid #3c3c3c; }
+  .ok { color: #4ec9b0; }
+  .bad { color: #f48771; }
+  .warn { color: #dcdcaa; }
+  code { background: #2d2d2d; padding: 1px 5px; border-radius: 2px; font-size: 12px; }
+  audio { width: 100%; margin-top: 8px; }
+  button { padding: 6px 12px; margin-right: 8px; cursor: pointer;
+           background: #0e639c; color: #fff; border: none; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h2>裸 AAC 播放路线验证</h2>
+<p style="font-size:13px;color:#999">
+本页验证同一个 <code>audio.aac</code> 文件在三种加载方式下的可播放性。
+选择文件后自动依次测试。
+</p>
+
+<div class="row">
+  <button id="pick">选择 audio.aac 文件</button>
+  <span id="info" style="font-size:12px;color:#999"></span>
+</div>
+
+<div id="results"></div>
+
+<script>
+const out = document.getElementById('results');
+
+function log(html) {
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.innerHTML = html;
+  out.appendChild(d);
+}
+
+document.getElementById('pick').onclick = () => {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.aac,audio/*';
+  inp.onchange = () => { if (inp.files[0]) run(inp.files[0]); };
+  inp.click();
+};
+
+function probe(label, makeUrl, revoke) {
+  return new Promise((resolve) => {
+    const url = makeUrl();
+    const a = new Audio();
+    a.preload = 'metadata';
+    const t = setTimeout(() => {
+      log(`<b>${label}</b><br><span class="bad">超时（5s）</span>`);
+      resolve(false);
+    }, 5000);
+    a.onloadedmetadata = () => {
+      clearTimeout(t);
+      log(`<b>${label}</b><br><span class="ok">✅ 可播放</span> duration=${a.duration.toFixed(3)}s`);
+      if (revoke) revoke();
+      resolve(true);
+    };
+    a.onerror = () => {
+      clearTimeout(t);
+      const c = a.error ? a.error.code : '?';
+      const names = {1:'ABORTED',2:'NETWORK',3:'DECODE',4:'SRC_NOT_SUPPORTED'};
+      log(`<b>${label}</b><br><span class="bad">❌ 失败</span> code=${c} ${names[c]||''}`);
+      if (revoke) revoke();
+      resolve(false);
+    };
+    a.src = url;
+  });
+}
+
+async function run(file) {
+  out.innerHTML = '';
+  document.getElementById('info').textContent =
+    `${file.name} · ${(file.size/1024/1024).toFixed(2)} MB · type="${file.type || '(空)'}"`;
+
+  // 读文件
+  const ab = await file.arrayBuffer();
+  const u8 = new Uint8Array(ab);
+  const head = Array.from(u8.slice(0, 4)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+  log(`<b>文件头</b>: <code>${head}</code>` +
+      (u8[0] === 0xff && (u8[1] & 0xf0) === 0xf0
+        ? ' <span class="ok">ADTS 同步字 ✓</span>'
+        : ' <span class="bad">非 ADTS 同步字 ✗</span>'));
+
+  // 路线 1：Blob，MIME = audio/aac
+  await probe('路线 1 · Blob + type="audio/aac"',
+    () => URL.createObjectURL(new Blob([ab], {type:'audio/aac'})));
+
+  // 路线 2：Blob，空 MIME（依赖 sniffing）
+  await probe('路线 2 · Blob + type=""（依赖嗅探）',
+    () => URL.createObjectURL(new Blob([ab], {type:''})));
+
+  // 路线 3：Blob，MIME = audio/mp4
+  await probe('路线 3 · Blob + type="audio/mp4"',
+    () => URL.createObjectURL(new Blob([ab], {type:'audio/mp4'})));
+
+  // 路线 4：DataURI
+  let bin = '';
+  const CH = 0x8000;
+  for (let i = 0; i < u8.length; i += CH) {
+    bin += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+  }
+  await probe('路线 4 · DataURI (audio/aac;base64)',
+    () => 'data:audio/aac;base64,' + btoa(bin));
+
+  log('<b>结论</b><br>哪条路线显示 ✅ 就把 <code>&lt;audio&gt;</code> 的 src 换成那种形式。' +
+      '<br>若全部 ❌ 且 code=3，说明文件数据本身有问题（但头部检查已通过，则更可能是浏览器不支持裸 ADTS）。');
+}
+
+// 报告 UA
+log('<b>环境</b><br>UA: <code>' + navigator.userAgent + '</code>');
+</script>
+</body>
+</html>

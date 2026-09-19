@@ -1,0 +1,104 @@
+{
+  "name": "listening-trainer",
+  "displayName": "Listen & Write · 听写英语",
+  "description": "Listen & Write · 听写英语 —— 逐句听写 + 词级 diff 诊断，把「听不懂」变成可追踪的数据",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Education", "Other"],
+  "keywords": ["english", "listening", "dictation", "english learning", "听力", "精听"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "listeningTrainer",
+          "title": "Listen & Write",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "listeningTrainer": [
+        {
+          "id": "listeningTrainer.practice",
+          "name": "听写练习",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "listeningTrainer.openPractice",
+        "title": "Listen & Write: 打开精听练习",
+        "icon": "$(play)"
+      },
+      {
+        "command": "listeningTrainer.loadTed",
+        "title": "Listen & Write: 从 TED 链接加载素材"
+      },
+      {
+        "command": "listeningTrainer.loadLocal",
+        "title": "Listen & Write: 从本地音频加载素材"
+      },
+      {
+        "command": "listeningTrainer.showReport",
+        "title": "Listen & Write: 查看听力诊断报告"
+      },
+      {
+        "command": "listeningTrainer.clearCache",
+        "title": "Listen & Write: 清除音频缓存"
+      }
+    ],
+    "configuration": {
+      "title": "Listen & Write",
+      "properties": {
+        "listeningTrainer.proxy": {
+          "type": "string",
+          "default": "",
+          "description": "访问 TED 时使用的代理，如 http://127.0.0.1:7890。留空则跟随系统/VS Code http.proxy 设置。"
+        },
+        "listeningTrainer.materialsDir": {
+          "type": "string",
+          "default": "",
+          "description": "素材存放位置（绝对路径），如 D:\\ListeningMaterials。留空使用默认位置（扩展全局存储下的 materials 目录）。修改后已下载的素材会自动迁移到新位置，重载窗口生效。"
+        },
+        "listeningTrainer.audioQuality": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "default": "medium",
+          "description": "音频质量。medium 约 138kbps / 8MB 每 8 分钟。"
+        },
+        "listeningTrainer.concurrency": {
+          "type": "number",
+          "default": 6,
+          "description": "分片下载并发数。"
+        },
+        "listeningTrainer.autoReplayOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "听写错误时自动重播该句。"
+        },
+        "listeningTrainer.skipIntro": {
+          "type": "boolean",
+          "default": true,
+          "description": "裁掉 TED 片头（3.527s）。关闭后需用 VTT 原始时间轴。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "node ./out/test/runTests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {}
+}

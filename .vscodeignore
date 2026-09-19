@@ -1,0 +1,19 @@
+# 源码与开发配置不进 vsix（运行时只需要 out/ 与 vendor/）
+src/**
+.vscode/**
+.workbuddy/**
+**/*.map
+tsconfig.json
+.vscodeignore
+
+# 测试产物不进（运行时代码在 out/ 根与 out/core|sources|webview）
+out/test/**
+
+# ★ vendor/ 必须保留：转码用的 libav(WASM, ~1.6MB) 与 lamejs(~540KB)
+#   它们不在 node_modules 里（项目零运行时依赖），是直接复制进来的，
+#   一旦被排除，打包后转码会报「模块不存在」。
+!vendor/**
+
+# node_modules 里只有 devDependencies（@types + typescript），
+# vsce 默认已排除；这里显式写一遍避免配置漂移。
+node_modules/**

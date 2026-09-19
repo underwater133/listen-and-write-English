@@ -1,0 +1,21 @@
+# 依赖与编译产物
+node_modules/
+out/
+
+# VS Code 本地开发（launch.json 保留）
+.vscode/*
+!.vscode/launch.json
+
+# 转码 vendor 不进仓库的话体积很大 —— 但它是运行时必需（libav wasm + lamejs），必须提交
+!vendor/
+
+# 系统与工作区杂项
+.DS_Store
+Thumbs.db
+*.log
+.workbuddy/
+
+# 本地实验产物
+*.mp3
+*.aac
+*.m4a
