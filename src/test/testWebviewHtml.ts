@@ -557,6 +557,66 @@ check(
   /state\.showAudioDiag[\s\S]{0,240}请点 🔧/.test(panel),
   '提示里硬提 🔧，开关关着时用户根本找不到该按钮'
 );
+
+/* ---------- 空输入不得进入判定（2026-09-19） ----------
+ * 症状：输入框空着点「检查」也会判定。
+ * 真正的危害不只是"多了一条判定"：checkSentence(idx, 原句, '') 会把原句里
+ * 每个词都判成「漏听」，宿主随即把它写进错题库 —— 而错题库是【累积】的，
+ * 一次手滑就足以让诊断报告的「弱读盲区 TOP」「最常出错的词」长期失真。
+ *
+ * 因此页面侧与宿主侧都要拦；页面侧负责给用户一个解释，宿主侧是兜底
+ * （错题库的写入点必须自己防住，未来新增入口也走这里）。
+ */
+check(
+  'panel.ts: 页面侧拦截空输入（不发 check，给提示）',
+  /function doCheck[\s\S]{0,900}if \(!ta\.value\.trim\(\)\) \{/.test(panel) &&
+    /还没输入内容/.test(panel),
+  '空输入仍会被送去判定'
+);
+check(
+  'panel.ts: 宿主 check 通道丢弃空输入（兜底，护住错题库）',
+  /case 'check':[\s\S]{0,900}if \(!input\.trim\(\)\) return;/.test(panel),
+  '错题库写入点没有自我防护：历史污染会一直累积'
+);
+check(
+  'panel.ts: 通用提示与播放错误分开（空输入提示不能带「播放失败：」前缀）',
+  /function showNotice/.test(panel) &&
+    /showNotice\('播放失败：' \+ text\)/.test(panel),
+  '复用 showPlayerError 会让"还没输入内容"看起来像音频坏了'
+);
+
+/* ---------- 清空错题库（诊断报告页，2026-09-19） ----------
+ * 为什么需要：错题库是**追加累积**的。早期版本允许空输入提交判定，
+ * checkSentence 会把整句每个词都判成「漏听」，一次手滑就往库里塞了整句的
+ * 假错误；而报告口径是历史累计 —— 这种污染没法逐条挑出来，只能整体重置。
+ */
+check(
+  'extension.ts: MistakeStore 提供 clear()',
+  /clear\(\): void \{/.test(extSrc),
+  '没有清空能力，被污染的统计只能一直挂着'
+);
+check(
+  'panel.ts: 诊断报告有「清空数据」入口（仅在确有记录时才显示）',
+  /id="clearStats"/.test(panel) && /rep\.totalAttempts > 0/.test(panel),
+  '缺少入口'
+);
+check(
+  'panel.ts: 清空需宿主弹确认框（webview 的 window.confirm 恒返回 false）',
+  /case 'clearMistakes'/.test(panel) &&
+    /showWarningMessage\([\s\S]{0,400}'清空'/.test(panel),
+  '不可逆操作必须确认，且确认框只能由宿主弹'
+);
+check(
+  'panel.ts: 清空后立即用新数据重绘报告',
+  /case 'clearMistakes'[\s\S]{0,900}this\.showReport\(\)/.test(panel),
+  '清空了却还显示旧统计'
+);
+check(
+  'panel.ts: 确认框写明将删除的条数（不是盲点「清空」）',
+  /case 'clearMistakes'[\s\S]{0,400}readAll\(\)\.length/.test(panel) &&
+    /将删除 \$\{count\} 条/.test(panel),
+  '确认框没告诉用户后果有多重'
+);
 check('panel.ts: 绑定了 load 按钮点击', /getElementById\('load'\)\.onclick/.test(panel));
 check('panel.ts: 绑定了 report 按钮点击', /getElementById\('report'\)\.onclick/.test(panel));
 check('panel.ts: 含 audio error 监听', /player\.addEventListener\('error'/.test(panel));

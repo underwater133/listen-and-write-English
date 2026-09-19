@@ -505,6 +505,12 @@ export class PracticePanel {
         const input: string = msg.input ?? '';
         const m = this.material;
         if (!m || !m.sentences[idx]) return;
+        // ⚠️ 兜底：空输入绝不进判定。
+        //    checkSentence 会把整句每个词都判成「漏听」，紧接着就被 append
+        //    进错题库；污染是【累积】的，会让诊断报告长期失真。
+        //    页面侧已拦一道，但错题库的写入点必须自己再防一次
+        //    （以后新增入口也会经过这里）。
+        if (!input.trim()) return;
 
         const result = checkSentence(idx, m.sentences[idx].text, input);
         // 只有有错误才记录，避免污染统计
@@ -518,6 +524,43 @@ export class PracticePanel {
       case 'requestReport':
         this.showReport();
         break;
+
+      /**
+       * 清空错题库（诊断报告页的「清空数据」）。
+       *
+       * ⚠️ 确认框必须由宿主弹：webview 是 sandboxed iframe，Chromium 会忽略
+       *    window.confirm 并恒返回 false（项目里 deleteCached 已踩过这个坑）。
+       *    而且这是不可逆操作 —— 素材与时间轴修正不受影响，但历史错题会全没。
+       */
+      case 'clearMistakes': {
+        // 二次确认：点按钮只是发起，真正执行要在这里再确认一次。
+        // 文案里写明「将删除 N 条」而不是干巴巴问一句 —— 让用户知道后果的重量。
+        const count = this.store.readAll().length;
+        if (count === 0) {
+          this.webview.postMessage({ type: 'notice', message: '没有可清空的记录。' });
+          break;
+        }
+        const pick = await vscode.window.showWarningMessage(
+          `确定清空全部听力错误记录？将删除 ${count} 条，诊断报告会归零。`,
+          {
+            modal: true,
+            detail: '此操作不可撤销。已下载的素材、以及你手工修正过的句子时间轴都不受影响。',
+          },
+          '清空'
+        );
+        if (pick !== '清空') break;
+        try {
+          this.store.clear();
+          // 立刻用清空后的数据重绘，页面不会留着旧统计
+          this.showReport();
+        } catch (e: any) {
+          this.webview.postMessage({
+            type: 'notice',
+            message: '清空失败：' + String(e?.message ?? e),
+          });
+        }
+        break;
+      }
 
       /**
        * ★ 终极兜底：由扩展宿主直接读音频文件，把字节交给 webview。
@@ -1546,6 +1589,8 @@ window.addEventListener('message', (e) => {
     render();
   }
   if (msg.type === 'timingError') showPlayerError(msg.message);
+  // 宿主发来的通用提示（例如"清空失败：…"）
+  if (msg.type === 'notice') showNotice(msg.message);
   // 影响渲染的配置（宿主在 ready 与配置变更时推；这里的 render 不动 currentIndex）
   if (msg.type === 'config') {
     state.showAudioDiag = !!msg.showAudioDiag;
@@ -2402,6 +2447,21 @@ function renderPractice() {
 function doCheck() {
   const ta = document.getElementById('input');
   if (!ta) return;
+
+  // ⚠️ 空输入（含纯空白）一律不送去判定。
+  //
+  // 为什么这是硬性要求：checkSentence(idx, 原句, '') 会把原句里【每一个词】
+  // 都判成「漏听」，result.correct = false，宿主随即把这条结果写进错题库。
+  // 一次手滑足以让诊断报告的「弱读盲区 TOP」「最常出错的词」全部失真，
+  // 而且错题库是累积的 —— 之后看到的报告都不可信（2026-09-19 反馈）。
+  //
+  // trim() 覆盖空格、制表符、换行与全角空格。
+  if (!ta.value.trim()) {
+    ta.focus();
+    showNotice('还没输入内容 —— 先写下你听到的部分，再检查。');
+    return;
+  }
+
   vscode.postMessage({
     type: 'check',
     sentenceIndex: state.currentIndex,
@@ -2411,9 +2471,13 @@ function doCheck() {
 
 /* ---------------- 播放 ---------------- */
 
-function showPlayerError(text) {
-  // 播放错误必须可见 —— 早期用 .catch(() => {}) 静默吞掉，
-  // 结果「点击播放没反应」完全无从排查。
+/**
+ * 页面内通用提示条（位置与样式复用播放错误那条）。
+ *
+ * ⚠️ 为什么不能直接拿 showPlayerError 当通用提示：它的文案前缀固定是
+ *    「播放失败：」—— 用来提示"还没输入内容"会让人以为音频坏了。
+ */
+function showNotice(text) {
   let box = document.getElementById('playerErr');
   if (!box) {
     box = document.createElement('div');
@@ -2422,8 +2486,14 @@ function showPlayerError(text) {
     const p = document.getElementById('practice');
     if (p) p.appendChild(box);
   }
-  box.textContent = '播放失败：' + text;
+  box.textContent = text;
   box.style.display = 'block';
+}
+
+function showPlayerError(text) {
+  // 播放错误必须可见 —— 早期用 .catch(() => {}) 静默吞掉，
+  // 结果「点击播放没反应」完全无从排查。
+  showNotice('播放失败：' + text);
 }
 
 function clearPlayerError() {
@@ -3012,7 +3082,15 @@ function renderReport(rep) {
               '</table>'
             : '')
       ) +
-      '<div style="margin-top:16px"><button id="back" class="ghost">返回练习</button></div>' +
+      '<div style="margin-top:16px">' +
+        '<button id="back" class="ghost">返回练习</button>' +
+        // 只有真有记录时才给清空入口：空库上摆一个「清空」按钮没有意义，
+        // 反而让人以为藏着数据。确认框由宿主弹（不可逆操作）。
+        (rep.totalAttempts > 0
+          ? '<button id="clearStats" class="ghost" style="margin-left:8px;color:var(--err)"' +
+            ' title="清空全部听力错误记录（不可撤销）">清空数据</button>'
+          : '') +
+      '</div>' +
     '</div>';
 
   // 切到报告视图（布局按钮会自动隐藏：它只在精听界面出现）
@@ -3021,6 +3099,12 @@ function renderReport(rep) {
   // 「返回练习」只是切回练习视图 —— #root 里一直是练习界面，不需要重绘
   const back = document.getElementById('back');
   if (back) back.onclick = () => showView('practice');
+
+  // 清空错题库：确认与执行都在宿主侧，页面只发请求
+  const clearStatsBtn = document.getElementById('clearStats');
+  if (clearStatsBtn) {
+    clearStatsBtn.onclick = () => vscode.postMessage({ type: 'clearMistakes' });
+  }
 }
 
 vscode.postMessage({ type: 'ready' });

@@ -356,4 +356,24 @@ export class MistakeStore {
     }
     return out;
   }
+
+  /**
+   * 清空全部错误记录（诊断报告页的「清空数据」）。
+   *
+   * 为什么需要整库清空：错题库是**追加累积**的，一旦混进脏数据就再也分不出来。
+   * 典型来源：早期版本允许空输入提交判定 —— checkSentence 会把整句每个词都
+   * 判成「漏听」，一次手滑就往库里塞了一整句的假错误，而统计口径是"历史累计"，
+   * 报告会长期失真。这种污染没法逐条挑出来，只能整体重置。
+   *
+   * 直接删文件（而不是清空内容）：readAll 对不存在的文件返回空数组，语义一致，
+   * 也不留空壳。删不掉（例如被占用）时退化为截断；再失败就抛给调用方提示。
+   */
+  clear(): void {
+    if (!fs.existsSync(this.file)) return;
+    try {
+      fs.unlinkSync(this.file);
+    } catch {
+      fs.writeFileSync(this.file, '', 'utf8');
+    }
+  }
 }
