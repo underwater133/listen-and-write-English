@@ -1,8 +1,10 @@
 /**
  * 缓存校验逻辑测试
  *
- * 验证 quickValidateAac 能正确识别坏文件，
- * 以及 fetchAudio 的缓存复用闸门是否生效。
+ * 覆盖三件事：
+ *   1. quickValidateAac 能正确识别坏文件
+ *   2. 缓存路径重定位（素材目录被迁移后仍能复用，见 2026-09-19 事故）
+ *   3. fetchAudio 的缓存复用闸门判据
  *
  * 用法：node out/test/testCacheGuard.js
  */
@@ -11,6 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { quickValidateAac } from '../core/demux';
+import { relocateAudioPath, AudioInfo, AUDIO_CACHE_VERSION } from '../core/types';
 
 let pass = 0;
 let fail = 0;
@@ -86,6 +89,58 @@ function main(): void {
   );
   const r5 = quickValidateAac(Buffer.concat([realBad, Buffer.alloc(200, 0x5a)]));
   check('实测坏样本被拒绝', !r5.ok, r5.reason ?? '');
+
+  /* ---------- 6. 素材目录迁移后的路径重定位 ----------
+   *
+   * 真实事故（2026-09-19）：配置 `listeningTrainer.materialsDir` 后，素材被
+   * 自动搬到新目录，但 audio.json 里存的仍是旧绝对路径。点素材库卡片报
+   * 「该素材的音频缓存已过期」——而 audio.mp3 就好好躺在当前目录里。
+   */
+  {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-relocate-'));
+    const oldDir = path.join(root, 'old', 'ted-99');
+    const newDir = path.join(root, 'new', 'ted-99');
+    fs.mkdirSync(oldDir, { recursive: true });
+    fs.mkdirSync(newDir, { recursive: true });
+
+    const mp3 = Buffer.concat([Buffer.from([0xff, 0xfb, 0x90, 0x64]), Buffer.alloc(4096, 0x11)]);
+    fs.writeFileSync(path.join(newDir, 'audio.mp3'), mp3);
+
+    const info: AudioInfo = {
+      path: path.join(oldDir, 'audio.mp3'), // 旧位置，已随目录搬迁消失
+      format: 'mp3',
+      durationMs: 1000,
+      sampleRate: 44100,
+      channels: 2,
+      frameCount: 10,
+      bytes: mp3.length,
+      startOffsetMs: -3504,
+      cacheVersion: AUDIO_CACHE_VERSION,
+    };
+
+    const relocated = relocateAudioPath(newDir, info);
+    check(
+      '迁移后能按当前目录重新定位音频（旧绝对路径失效）',
+      relocated === path.join(newDir, 'audio.mp3'),
+      String(relocated)
+    );
+
+    // 反面：真的没有音频文件时必须返回 null，不能瞎猜一个路径
+    check('目录里没有音频文件时返回 null', relocateAudioPath(oldDir, info) === null);
+
+    // 路径本来就有效时不应改动
+    const fresh: AudioInfo = { ...info, path: path.join(newDir, 'audio.mp3') };
+    check(
+      '路径仍有效时原样返回',
+      relocateAudioPath(oldDir, fresh) === path.join(newDir, 'audio.mp3')
+    );
+
+    // 记录里的目录部分不可信：只允许取文件名，不能顺着 ".." 往外跑
+    const escaping: AudioInfo = { ...info, path: path.join('..', '..', 'audio.mp3') };
+    check('忽略记录里的目录部分（防越界）', relocateAudioPath(newDir, escaping) === path.join(newDir, 'audio.mp3'));
+
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 
   console.log(`\n=== 结果: ${pass} 通过 / ${fail} 失败 ===`);
   if (fail > 0) process.exit(1);

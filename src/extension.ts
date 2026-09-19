@@ -33,12 +33,58 @@ function resolveCacheRoot(cfgValue: string): string {
 }
 
 /**
+ * 修正素材目录内记录里的【绝对路径】。
+ *
+ * ⚠️ 为什么搬迁后必须做这一步：
+ *   audio.json.path 与 material.json.cacheDir 存的是写入时的绝对路径。
+ *   目录被搬走后它们仍指向旧位置，后果是：
+ *     - 点素材库卡片 → 判 existsSync 失败 → 误报「音频缓存已过期」
+ *     - 恢复上次素材时 readFileSync 抛错 → 素材被静默跳过
+ *     - audioUri 指向不存在的文件 → 播放静默失败
+ *   （2026-09-19 实测：配置 materialsDir 后必现）
+ *
+ * 读取侧也做了兜底重定位（core/types.ts 的 relocateAudioPath），
+ * 这里就地修正则是为了让磁盘上的数据自愈，避免旧路径一直留在文件里。
+ */
+function fixAbsolutePathsInDir(dir: string): void {
+  const audioJson = path.join(dir, 'audio.json');
+  if (fs.existsSync(audioJson)) {
+    try {
+      const info = JSON.parse(fs.readFileSync(audioJson, 'utf8')) as { path?: string };
+      // 只按文件名重定位，绝不接受记录里的目录部分（防越界）
+      const target = path.join(dir, path.basename(info.path || 'audio.mp3'));
+      if (info.path !== target && fs.existsSync(target)) {
+        info.path = target;
+        fs.writeFileSync(audioJson, JSON.stringify(info, null, 2), 'utf8');
+        trace(`已修正音频路径记录 → ${target}`);
+      }
+    } catch {
+      /* 单条记录损坏不影响迁移 */
+    }
+  }
+
+  const metaJson = path.join(dir, 'material.json');
+  if (fs.existsSync(metaJson)) {
+    try {
+      const m = JSON.parse(fs.readFileSync(metaJson, 'utf8')) as { cacheDir?: string };
+      if (m.cacheDir !== dir) {
+        m.cacheDir = dir;
+        fs.writeFileSync(metaJson, JSON.stringify(m, null, 2), 'utf8');
+      }
+    } catch {
+      /* 同上 */
+    }
+  }
+}
+
+/**
  * 把 from 下的素材目录整体搬到 to。
  *
  * 规则（保证幂等与安全）：
  *   - 只搬「含 material.json」的目录，跳过杂项文件
  *   - 目标同名目录已存在则跳过（两边都保留，绝不覆盖 —— 用户数据面前宁可多余不可丢失）
  *   - rename 失败（跨盘 EXDEV）退化为复制 + 删除源
+ *   - 搬完立刻修正目录内的绝对路径（否则缓存会「看起来过期」）
  */
 function migrateMaterials(from: string, to: string): { moved: number; skipped: number } {
   if (!from || from === to || !fs.existsSync(from)) return { moved: 0, skipped: 0 };
@@ -60,6 +106,8 @@ function migrateMaterials(from: string, to: string): { moved: number; skipped: n
       fs.cpSync(src, dst, { recursive: true });
       fs.rmSync(src, { recursive: true, force: true });
     }
+    // 搬完立刻把目录内的绝对路径改成新位置 —— 否则缓存会被判成「已过期」
+    fixAbsolutePathsInDir(dst);
     moved++;
   }
   return { moved, skipped };
@@ -196,8 +244,8 @@ export function activate(context: vscode.ExtensionContext): void {
               message: `已解析 ${material.sentences.length} 句，准备音频…`,
             });
 
-            const ready = await adapter.fetchAudio(material, (done, total) => {
-              progress.report({ message: `下载音频 ${done}/${total}` });
+            const ready = await adapter.fetchAudio(material, (p) => {
+              progress.report({ message: p.message });
             });
 
             PracticePanel.createOrShow(context, panelDeps);

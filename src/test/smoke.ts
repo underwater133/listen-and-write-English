@@ -12,6 +12,15 @@ import * as path from 'path';
 import * as os from 'os';
 import { TedSource } from '../sources/ted';
 import { checkSentence } from '../core/diff';
+import { isValidMp3 } from '../core/transcode';
+import { AUDIO_CACHE_VERSION } from '../core/types';
+
+/** 软断言计数：❌ 必须影响退出码，否则「有失败但报全部通过」又是一次假信号 */
+let softFail = 0;
+function line(ok: boolean, text: string): void {
+  if (!ok) softFail++;
+  console.log(`  ${ok ? '✅' : '❌'} ${text}`);
+}
 
 const TALK_URL =
   'https://www.ted.com/talks/bill_gates_the_next_outbreak_we_re_not_ready';
@@ -79,9 +88,10 @@ async function main(): Promise<void> {
   console.log('');
   console.log('[2/3] 下载并解封装音频…');
   let t = Date.now();
-  const ready = await ted.fetchAudio(material, (done, total) => {
-    if (done === total || done % 20 === 0) {
-      process.stdout.write(`\r  下载 ${done}/${total}`);
+  const ready = await ted.fetchAudio(material, (p) => {
+    // 下载阶段抽稀打印，其余阶段（解封装/转码）每报必打 —— 它们本来就只有十几次
+    if (p.stage !== 'download' || p.done === p.total || p.done % 20 === 0) {
+      process.stdout.write(`\r  ${p.message}                    `);
     }
   });
   process.stdout.write('\n');
@@ -128,48 +138,41 @@ async function main(): Promise<void> {
   ).length;
   console.log(`  ✅ 被钳制的句数: ${clampedInfo}`);
 
-  /* ---------- 步骤 2.5: ADTS 帧链完整性（关键回归防线） ---------- */
+  /* ---------- 步骤 2.5: 产物与缓存完整性（关键回归防线） ---------- */
   //
-  // ⚠️ 这一组断言是为了防止「静默坏文件」再次逃逸。
+  // ⚠️ v5 起最终产物是 MP3（裸流，没有容器结构可查），所以判据从
+  //    「ADTS 帧链能否贯穿到底」换成**共享的** isValidMp3()。
   //
-  // 背景：早期 demuxPid 只剥 TS 包头、没剥 PES 头，导致每约 2700 字节
-  // 就有一个 PES 头混进 ES 流，把 ADTS 帧链打断。
-  // 产出的 .aac 在浏览器里播放静默失败（解码器无法同步），
-  // 而当时的「帧数守恒」验证完全没发现 —— 因为两侧都同样多插了 PES 头。
+  // 历史背景（别删）：v3 之前这里校验的是 audio.aac 的 ADTS 帧链。
+  //    早期 demuxPid 只剥 TS 包头、没剥 PES 头，每约 2700 字节就有一个
+  //    PES 头混进 ES 流把帧链打断，产出的文件在浏览器里静默失败；
+  //    而当时的「帧数守恒」验证完全没发现 —— 因为两侧都同样多插了 PES 头。
   //
-  // 教训：帧数守恒 ≠ 数据正确。必须校验「帧链是否贯穿到底」。
+  // 教训：帧数守恒 ≠ 数据正确；判据必须跟着**当前产物**走，且单一来源。
+  //    （2026-09-19 清理：这一段曾长期对 MP3 产物做 ADTS 校验，
+  //      结果标准流程里恒报 ❌、脚本却仍打印「全部通过」——又是个假信号。）
   const buf = fs.readFileSync(audio.path);
-  let off = 0;
-  let chainFrames = 0;
-  let brokenAt = -1;
-  while (off + 7 <= buf.length) {
-    if (buf[off] !== 0xff || (buf[off + 1] & 0xf0) !== 0xf0) {
-      brokenAt = off;
-      break;
-    }
-    const b3 = buf[off + 3];
-    const len = ((b3 & 0x03) << 11) | (buf[off + 4] << 3) | ((buf[off + 5] >> 5) & 0x07);
-    if (len < 12 || off + len > buf.length) {
-      brokenAt = off;
-      break;
-    }
-    chainFrames++;
-    off += len;
-  }
-  const tailBytes = buf.length - off;
-  const chainOk = brokenAt === -1 && tailBytes === 0;
-  console.log(
-    `  ${chainOk ? '✅' : '❌'} ADTS 帧链完整：走通 ${chainFrames} 帧，` +
-      (chainOk ? '贯穿至文件末尾' : `断链@${brokenAt}，尾部剩余 ${tailBytes} B`)
+
+  line(audio.format === 'mp3', `最终产物格式为 MP3（format=${audio.format}）`);
+
+  const mp3Ok = isValidMp3(buf);
+  line(
+    mp3Ok,
+    `MP3 结构校验通过（共享判据 isValidMp3，${(buf.length / 1024 / 1024).toFixed(2)}MB）`
   );
-  const frameCountMatch = chainFrames === audio.frameCount;
-  console.log(
-    `  ${frameCountMatch ? '✅' : '❌'} 帧数一致：链上 ${chainFrames} vs 记录 ${audio.frameCount}`
+
+  line(
+    audio.cacheVersion === AUDIO_CACHE_VERSION,
+    `cacheVersion = ${audio.cacheVersion}（当前 ${AUDIO_CACHE_VERSION}）`
   );
-  // 首帧必须是干净的 ADTS 头（早期 bug 会留下 "Lavc58.101.101" 之类的残留）
-  const headClean = buf[0] === 0xff && (buf[1] & 0xf0) === 0xf0;
-  console.log(
-    `  ${headClean ? '✅' : '❌'} 文件头为纯 ADTS 同步字（无 PES/编码器残留）`
+
+  // 中间产物不应残留：裸 ADTS / MP4 在 VS Code 里都播不了，留着只占空间且易混淆
+  const leftovers = ['audio.aac', 'audio.m4a'].filter((f) =>
+    fs.existsSync(path.join(ready.cacheDir, f))
+  );
+  line(
+    leftovers.length === 0,
+    '中间产物已清理' + (leftovers.length ? `：残留 ${leftovers.join(', ')}` : '')
   );
 
   /* ---------- 步骤 3: diff 校验 ---------- */
@@ -194,7 +197,14 @@ async function main(): Promise<void> {
   }
 
   console.log('');
-  console.log('===== 冒烟测试全部通过，总耗时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's =====');
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  if (softFail === 0) {
+    console.log('===== 冒烟测试全部通过，总耗时 ' + secs + 's =====');
+  } else {
+    // ❌ 必须影响退出码 —— 否则「有失败但报全部通过」又是一次假信号
+    console.log('===== 冒烟测试有 ' + softFail + ' 项失败，总耗时 ' + secs + 's =====');
+    process.exitCode = 1;
+  }
   console.log('');
   console.log('下一步：在 VS Code 中打开本目录，按 F5 启动扩展开发宿主。');
 }

@@ -21,7 +21,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { ListeningMaterial, MaterialSourceAdapter, AudioInfo, clampSentencesToAudio, AUDIO_CACHE_VERSION } from '../core/types';
+import { ListeningMaterial, MaterialSourceAdapter, AudioInfo, AudioProgress, relocateAudioPath, clampSentencesToAudio, extractNextDataJson, TedNextData, AUDIO_CACHE_VERSION } from '../core/types';
+import { httpGetText } from '../core/http';
 import { checkSentence, SentenceResult, buildReport } from '../core/diff';
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
@@ -44,6 +45,16 @@ export interface CachedMaterial {
    * 目录名才是磁盘事实，两者不能混用。
    */
   dirName: string;
+  /**
+   * talk 页面 URL 里的 slug。
+   *
+   * ⚠️ 「已下载」判定必须用它，不能用 id：
+   *   搜索结果里的 `hit.id` 是 Algolia 的 objectID（实测 3292），
+   *   素材库的 id 是 `ted:<videoData.id>`（实测 ted:66）—— **两者不同源**！
+   *   按 id 对齐时「已下载」永远标不上（2026-09-19 实测）。
+   *   唯一稳定的公共字段是 slug（搜索结果与素材 sourceUrl 里都是它）。
+   */
+  slug: string;
   title: string;
   sentenceCount: number;
   hasAudio: boolean;
@@ -61,6 +72,61 @@ export interface CachedMaterial {
  * 这里曾有两份各自实现的 MP4 校验器，最终漂移成「坏缓存被判为合格」
  * 并反复复用。判据必须单一来源。
  */
+
+/**
+ * 缓存类错误统一的第二行提示。
+ *
+ * ⚠️ 不能沿用默认的「如果是网络问题，请配置 proxy」——素材目录迁移导致的
+ *    路径失效是纯本地问题，把用户往代理上引只会浪费排查时间（实测反馈）。
+ */
+const CACHE_ERR_HINT =
+  '这是本地素材缓存的问题，与网络/代理无关。到「素材库」删掉该素材，再从「发现 TED」重新加载一次即可。';
+
+/** 「发现 TED」卡片展开时显示的简介 */
+interface TalkInfo {
+  description: string;
+  presenter: string;
+  durationMs: number;
+}
+
+/** 页面传给宿主的下载上下文：来源是列表时，进度要显示在卡片上而不是切视图 */
+interface LoadContext {
+  origin?: 'discover';
+  /** 卡片的对齐键（slug）—— webview 用它定位是哪一张卡片 */
+  slug?: string;
+}
+
+/**
+ * 从 talk 页面 URL 里取 slug（搜索结果里用的也是这个字段）。
+ *
+ * ⚠️ 「已下载」与「下载进度」的对齐一律走 slug，不要用 id：
+ *   搜索结果的 hit.id 是 Algolia objectID，素材库 id 是 ted:<videoData.id>，
+ *   两者不同源（实测 3292 vs 66）。
+ */
+function slugFromUrl(url: string | undefined): string {
+  if (!url) return '';
+  const m = String(url).match(/\/talks\/([^/?#]+)/i);
+  return m ? m[1] : '';
+}
+
+/**
+ * 把素材源上报的音频进度映射成进度条百分比。
+ *
+ * 刻度分配（总进度 20% 起，解析元数据已用掉前 20%）：
+ *   下载  20 → 90（按下发数线性推进）
+ *   解封装 90 → 93（同步计算，按分片数推进）
+ *   转码  93 → 99（耗时主体，实测 8MB 音频约 24s）
+ *   100 由调用方在生成完 material 后补
+ *
+ * 为什么不沿用「下载到 N/N 就是 95%」：下载完还有 20~30s 的转码，
+ * 进度条会顶在 95% 不动、文案停在「下载音频 192/192」，
+ * 看起来就是卡死（2026-09-19 用户实测反馈）。
+ */
+function mapAudioProgress(p: AudioProgress): number {
+  if (p.stage === 'download') return 20 + Math.round(p.ratio * 70);
+  if (p.stage === 'demux') return 90 + Math.round(p.ratio * 3);
+  return 93 + Math.round(p.ratio * 6);
+}
 
 export class PracticePanel {
   public static current: PracticePanel | undefined;
@@ -82,6 +148,8 @@ export class PracticePanel {
   private material: ListeningMaterial | undefined;
   private audioUri: string | undefined;
   private disposables: vscode.Disposable[] = [];
+  /** 简介缓存（key = talkId 或 slug）——同一张卡片反复展开不重复发请求 */
+  private readonly talkInfoCache = new Map<string, TalkInfo>();
 
   static createOrShow(ctx: vscode.ExtensionContext, deps: PanelDeps): PracticePanel {
     const column = vscode.ViewColumn.Beside;
@@ -225,11 +293,12 @@ export class PracticePanel {
       const candidates: Array<{ m: ListeningMaterial; hasAudio: boolean; ts: number }> = [];
 
       for (const d of dirs) {
-        const p = path.join(this.deps.cacheRoot, d.name, 'material.json');
+        const dir = path.join(this.deps.cacheRoot, d.name);
+        const p = path.join(dir, 'material.json');
         if (!fs.existsSync(p)) continue;
         try {
           const m = JSON.parse(fs.readFileSync(p, 'utf8')) as ListeningMaterial;
-          const audioInfoPath = path.join(this.deps.cacheRoot, d.name, 'audio.json');
+          const audioInfoPath = path.join(dir, 'audio.json');
           let hasAudio = false;
           if (fs.existsSync(audioInfoPath)) {
             const info = JSON.parse(fs.readFileSync(audioInfoPath, 'utf8')) as AudioInfo;
@@ -239,6 +308,16 @@ export class PracticePanel {
             if (info.cacheVersion !== AUDIO_CACHE_VERSION) {
               continue;
             }
+            // ★ 音频路径必须按【当前目录】重新定位：
+            //   audio.json 里的 path 是写入时的绝对路径，素材目录被迁移过
+            //   （materialsDir 变更会自动搬运）就指向旧位置，readFileSync 直接
+            //   抛错，整个素材会被静默跳过 —— 表现为「打开窗口后什么都不加载」。
+            const audioPath = relocateAudioPath(dir, info);
+            if (!audioPath) {
+              trace('[LT-TRACE] 音频文件缺失（目录: ' + dir + '），跳过该素材');
+              continue;
+            }
+            info.path = audioPath;
             // 再校验文件本身（版本对但文件被截断/损坏的情况）
             //
             // ⚠️ v5 起最终产物是 MP3（裸流，没有容器结构可查）。
@@ -246,7 +325,7 @@ export class PracticePanel {
             //    isValidMp3 看文件头帧同步 + 是否还能扫到若干处同步，
             //    足以挡住「空文件 / 被截断 / 根本不是 MP3」。
             try {
-              const buf = fs.readFileSync(info.path);
+              const buf = fs.readFileSync(audioPath);
               if (!isValidMp3(buf)) {
                 trace('[LT-TRACE] 缓存 MP3 校验不合格（非 MP3 或被截断），跳过');
                 continue;
@@ -256,6 +335,8 @@ export class PracticePanel {
             }
 
             m.audio = info;
+            // cacheDir 同样是旧绝对路径 —— 删除素材时要靠它判断「当前素材」
+            m.cacheDir = dir;
             // 旧缓存兜底钳制
             if (m.audio?.durationMs) {
               m.sentences = clampSentencesToAudio(m.sentences, m.audio.durationMs);
@@ -300,6 +381,38 @@ export class PracticePanel {
    *   - 删除的是「当前正在练习的素材」时，通知页面停播并清空界面
    *   - 结束后重推列表，页面无需自行刷新
    */
+  /**
+   * ★ 删除确认必须由【宿主】用原生对话框完成，绝不能用 webview 里的 window.confirm()。
+   *
+   * 实测（2026-09-19）：VS Code 的 webview 是 sandboxed iframe，没有 allow-modals，
+   * Chromium 会直接【忽略】confirm 调用并返回 false（控制台只有一行 ignored 警告）。
+   * 于是 `if (!window.confirm(...)) return;` 每次都提前返回：
+   *   - 「删除 / 多选删除 / 全部删除」点了全部没反应
+   *   - 页面不报错、宿主也收不到消息 —— 典型的"静默失效"
+   * 改用 showWarningMessage({ modal: true }) 后，确认框由 VS Code 弹出，
+   * 用户点「删除」才真的删。这也与本项目其它破坏性操作（清空音频缓存命令）保持一致。
+   */
+  private async confirmAndDelete(dirNames: string[], titles: string[]): Promise<void> {
+    // 与 deleteCachedDirs 用同一套判据 —— 不能信任 webview 传来的目录名
+    const valid = dirNames.filter((n) => n && !/[\\/:*?"<>|]/.test(n));
+    if (!valid.length) return;
+
+    const what =
+      valid.length === 1
+        ? `素材《${(titles[0] || valid[0]).slice(0, 60)}》`
+        : `选中的 ${valid.length} 个素材`;
+    const pick = await vscode.window.showWarningMessage(
+      `确定删除${what}？音频缓存会一并删除，不可恢复。`,
+      { modal: true },
+      '删除'
+    );
+    if (pick !== '删除') return; // 取消：什么都不做，页面保持原状
+
+    // 先让页面退出多选模式，再删；删除完成后 deleteCachedDirs 会重推列表
+    this.webview.postMessage({ type: 'deleted', count: valid.length });
+    this.deleteCachedDirs(valid);
+  }
+
   private deleteCachedDirs(dirNames: string[]): void {
     const valid = dirNames.filter((n) => n && !/[\\/:*?"<>|]/.test(n));
     let removedCurrent = false;
@@ -350,6 +463,7 @@ export class PracticePanel {
           // ⚠️ 恢复素材必须用目录名，不能用 m.id（id 里可能含冒号等
           //    Windows 目录名非法字符，见 CachedMaterial.dirName 的注释）
           dirName: d.name,
+          slug: slugFromUrl(m.sourceUrl),
           title: m.title || m.id,
           sentenceCount: m.sentences?.length ?? 0,
           hasAudio,
@@ -432,7 +546,13 @@ export class PracticePanel {
             : 'popular';
           const page = Number(msg.page) || 0;
           const r = await tedApiSearch(String(msg.query ?? ''), sort, page);
-          this.webview.postMessage({ type: 'tedResults', reqId: msg.reqId, error: null, ...r });
+          // 附带「已下载」清单：页面据此在卡片上标注已下载 / 决定显示「下载」还是「练习」。
+          // 数据源就是素材库那套 scanCached()，不另外维护状态，删改后自然一致。
+          // ⚠️ 必须带 slug：搜索结果只有 slug 能和素材对上（id 不同源，见 slugFromUrl）
+          const cached = this.scanCached()
+            .filter((i) => i.hasAudio && i.slug)
+            .map((i) => ({ slug: i.slug, dirName: i.dirName }));
+          this.webview.postMessage({ type: 'tedResults', reqId: msg.reqId, error: null, cached, ...r });
         } catch (e: any) {
           this.webview.postMessage({
             type: 'tedResults',
@@ -448,15 +568,53 @@ export class PracticePanel {
         const names: string[] = Array.isArray(msg.dirNames)
           ? msg.dirNames.map(String)
           : [];
-        this.deleteCachedDirs(names);
+        // titles 只用于确认框里显示素材名，缺省时退回目录名
+        const titles: string[] = Array.isArray(msg.titles) ? msg.titles.map(String) : [];
+        await this.confirmAndDelete(names, titles);
         break;
       }
 
-      // 「发现 TED」卡片点击：slug → talk 页面 URL，走与手输链接相同的加载流程
+      /**
+       * 「发现 TED」卡片展开时取简介。
+       *
+       * 搜索接口不带简介（实测 4 个索引都没有该字段），所以只能按需取：
+       * 已缓存的读 material.json，未缓存的拉一次 talk 页面。
+       */
+      case 'talkInfo': {
+        const slug = String(msg.slug ?? '').trim();
+        const talkId = String(msg.id ?? '').trim();
+        if (!slug) break;
+        try {
+          const info = await this.fetchTalkInfo(slug, talkId);
+          this.webview.postMessage({
+            type: 'talkInfo',
+            reqId: msg.reqId,
+            slug,
+            error: null,
+            ...info,
+          });
+        } catch (e: any) {
+          this.webview.postMessage({
+            type: 'talkInfo',
+            reqId: msg.reqId,
+            slug,
+            error: String(e?.message ?? e),
+          });
+        }
+        break;
+      }
+
+      // 「发现 TED」卡片上的「下载」按钮：slug → talk 页面 URL，走与手输链接相同的加载流程。
+      // ⚠️ origin='discover'：下载期间页面留在列表、进度显示在卡片上，
+      //    所以进度消息必须带来源，页面不能一律切到练习视图。
       case 'loadTedUrl': {
         const url = String(msg.url ?? '').trim();
         if (/^https?:\/\/(www\.)?ted\.com\/talks\//i.test(url)) {
-          await this.loadFromInput(url);
+          // slug 既能定位卡片，也是下载完成回调里的对齐键（权威值仍以页面 URL 为准）
+          await this.loadFromInput(url, {
+            origin: 'discover',
+            slug: String(msg.slug ?? '') || slugFromUrl(url),
+          });
         }
         break;
       }
@@ -492,28 +650,45 @@ export class PracticePanel {
           if (!fs.existsSync(infoPath)) {
             this.webview.postMessage({
               type: 'error',
-              message: '该素材还没有音频缓存，请到「发现 TED」重新加载。',
+              message: '该素材还没有音频缓存，请重新加载一次。',
+              hint: CACHE_ERR_HINT,
             });
             return;
           }
           const info = JSON.parse(fs.readFileSync(infoPath, 'utf8')) as AudioInfo;
-          // 与 tryRestoreLast 同一判据：版本 + MP3 文件本身都要合格
-          if (info.cacheVersion !== AUDIO_CACHE_VERSION || !fs.existsSync(info.path)) {
+          // 与 tryRestoreLast 同一判据：版本 → 路径 → 文件本身
+          if (info.cacheVersion !== AUDIO_CACHE_VERSION) {
             this.webview.postMessage({
               type: 'error',
-              message: '该素材的音频缓存已过期，请到「发现 TED」重新加载一次。',
+              message: '该素材的音频缓存版本已过期，请重新加载一次。',
+              hint: CACHE_ERR_HINT,
             });
             return;
           }
-          if (!isValidMp3(fs.readFileSync(info.path))) {
+          // ★ 关键：不能直接用 info.path 判存在性。
+          //   audio.json 里存的是写入时的绝对路径，素材目录被迁移过就会失效，
+          //   原来的写法会误报「音频缓存已过期」——而文件其实好好地躺在当前目录里。
+          const audioPath = relocateAudioPath(dir, info);
+          if (!audioPath) {
             this.webview.postMessage({
               type: 'error',
-              message: '该素材的音频缓存损坏，请到「发现 TED」重新加载一次。',
+              message: '该素材的音频文件找不到了（目录里没有 audio.mp3），请重新加载一次。',
+              hint: CACHE_ERR_HINT,
+            });
+            return;
+          }
+          info.path = audioPath;
+          if (!isValidMp3(fs.readFileSync(audioPath))) {
+            this.webview.postMessage({
+              type: 'error',
+              message: '该素材的音频缓存损坏，请重新加载一次。',
+              hint: CACHE_ERR_HINT,
             });
             return;
           }
           const clamped = clampSentencesToAudio(m.sentences, info.durationMs);
-          this.loadMaterial({ ...m, sentences: clamped, audio: info, status: 'ready' });
+          // cacheDir 也按当前目录修正（删除素材时靠它判断「当前正在练的素材」）
+          this.loadMaterial({ ...m, cacheDir: dir, sentences: clamped, audio: info, status: 'ready' });
         } catch (e: any) {
           this.webview.postMessage({
             type: 'error',
@@ -567,38 +742,111 @@ export class PracticePanel {
     }
   }
 
-  private async loadFromInput(input: string): Promise<void> {
+  /**
+   * 取某个 talk 的简介（「发现 TED」卡片展开时用）。
+   *
+   * ⚠️ 为什么不能在搜索时就带上：实测（2026-09-19）TED 的 4 个 Algolia 索引
+   *    （relevance / popular / newest / oldest）返回的 hit 只有
+   *    _index / _score / duration / objectID / photos / slug / speakers / title
+   *    —— **没有简介**。所以只能展开时按需取：
+   *      1) 素材已缓存 → 直接读 material.json 里的 description（不联网）
+   *      2) 否则 GET talk 页面，取 __NEXT_DATA__.videoData.description
+   *    结果在实例内缓存（talkInfoCache），反复展开不再发请求。
+   */
+  private async fetchTalkInfo(slug: string, talkId: string): Promise<TalkInfo> {
+    const key = talkId || slug;
+    const cached = this.talkInfoCache.get(key);
+    if (cached) return cached;
+
+    // 1) 已缓存的素材：material.json 里本来就存了 description
+    if (talkId) {
+      try {
+        const metaPath = path.join(this.deps.cacheRoot, `ted-${talkId}`, 'material.json');
+        if (fs.existsSync(metaPath)) {
+          const m = JSON.parse(fs.readFileSync(metaPath, 'utf8')) as ListeningMaterial;
+          if (m.description) {
+            const info: TalkInfo = {
+              description: m.description,
+              presenter: m.presenter ?? '',
+              durationMs: m.audio?.durationMs ?? 0,
+            };
+            this.talkInfoCache.set(key, info);
+            return info;
+          }
+        }
+      } catch {
+        /* 缓存读不动就往下走，联网取 */
+      }
+    }
+
+    // 2) 联网拉页面（走与素材源同一套代理设置）
+    const proxy =
+      vscode.workspace.getConfiguration('listeningTrainer').get<string>('proxy', '') || undefined;
+    const html = await httpGetText(`https://www.ted.com/talks/${slug}`, { proxy });
+    const json = extractNextDataJson(html);
+    if (!json) throw new Error('页面结构已变更，取不到简介。');
+    const vd = (JSON.parse(json) as TedNextData).props?.pageProps?.videoData;
+
+    const info: TalkInfo = {
+      description: vd?.description ?? '',
+      presenter: vd?.presenterDisplayName ?? '',
+      durationMs: vd?.duration ? vd.duration * 1000 : 0,
+    };
+    this.talkInfoCache.set(key, info);
+    return info;
+  }
+
+  private async loadFromInput(input: string, opts?: LoadContext): Promise<void> {
+    // 进度消息统一带上来源 + slug：页面据此决定「切到练习视图」还是「只更新那张卡片」
+    const ctx: LoadContext = { origin: opts?.origin, slug: opts?.slug };
+
     const adapter = this.deps.adapters.find((a) => a.canHandle(input));
     if (!adapter) {
       this.webview.postMessage({
         type: 'error',
         message: '暂时只支持 TED 链接。请粘贴 https://www.ted.com/talks/... 形式的地址。',
+        ...ctx,
       });
       return;
     }
 
-    this.webview.postMessage({ type: 'progress', message: '解析页面…', percent: 5 });
+    this.webview.postMessage({ type: 'progress', message: '解析页面…', percent: 5, ...ctx });
     try {
       const material = await adapter.fetchMetadata(input, this.deps.cacheRoot);
       this.webview.postMessage({
         type: 'progress',
         message: `已解析 ${material.sentences.length} 句，下载音频…`,
         percent: 20,
+        ...ctx,
       });
 
-      const ready = await adapter.fetchAudio(material, (done, total) => {
+      // 进度文案由素材源给（下载 / 解封装 / 转码各阶段不同），这里只负责映射百分比
+      const ready = await adapter.fetchAudio(material, (p) => {
         this.webview.postMessage({
           type: 'progress',
-          message: `下载音频 ${done}/${total}`,
-          percent: 20 + Math.round((done / total) * 75),
+          message: p.message,
+          percent: mapAudioProgress(p),
+          ...ctx,
         });
       });
 
       this.loadMaterial(ready);
-      this.webview.postMessage({ type: 'progress', message: '就绪', percent: 100 });
-      this.webview.postMessage({ type: 'done' });
+      this.webview.postMessage({ type: 'progress', message: '就绪', percent: 100, ...ctx });
+      this.webview.postMessage({ type: 'done', ...ctx });
+
+      // 列表里发起的下载：额外告诉页面「这张卡片现在已下载」。
+      // slug 以素材自身的 sourceUrl 为准（与搜索结果的 slug 同源），
+      // 目录名一并带上（页面不必去猜 ted-<id> 的命名规则）。
+      if (opts?.origin === 'discover') {
+        this.webview.postMessage({
+          type: 'tedDownloaded',
+          slug: slugFromUrl(ready.sourceUrl) || opts.slug || '',
+          id: ready.id,
+          dirName: path.basename(ready.cacheDir),
+        });
+      }
     } catch (e) {
-      this.webview.postMessage({ type: 'error', message: (e as Error).message });
+      this.webview.postMessage({ type: 'error', message: (e as Error).message, ...ctx });
     }
   }
 
@@ -695,17 +943,36 @@ export class PracticePanel {
     --warn: #dcdcaa;
   }
   * { box-sizing: border-box; }
+  /* ⚠️ 页面本身【永不滚动】：滚动只发生在各视图内部（.list / .discover / .library）。
+     overflow:hidden 是硬性兜底 —— body 用的是 100vh，而 webview 的实际可视高度
+     与 100vh 可能差零点几像素，那点差值就足以凭空造出一条页面级滚动条，
+     看起来就像「布局被撑破了」（2026-09-19 反馈，无头测试复现不出这种差值）。 */
+  html { overflow: hidden; }
   body {
     margin: 0; padding: 0;
     font-family: var(--vscode-font-family);
     font-size: var(--vscode-font-size);
     color: var(--fg); background: var(--bg);
-    height: 100vh; display: flex; flex-direction: column;
+    height: 100vh; overflow: hidden; display: flex; flex-direction: column;
   }
+  /* 滚动条统一成 VS Code 自己的样式（10px + 半透明灰）。
+     不加这段就会用 Chromium 默认样式：又粗又黑，看到的瞬间会以为页面被撑破了。 */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(121,121,121,.4); border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(121,121,121,.7); }
+  ::-webkit-scrollbar-thumb:active { background: rgba(121,121,121,.8); }
+  ::-webkit-scrollbar-corner { background: transparent; }
   .topbar {
     padding: 8px 12px; border-bottom: 1px solid var(--border);
     display: flex; gap: 8px; align-items: center; flex: 0 0 auto;
+    /* 窄宽度（侧边栏）下按钮要换行，而不是被裁掉半截。
+       flex 默认 nowrap，加上页面锁了 overflow:hidden，溢出的按钮会直接消失。 */
+    flex-wrap: wrap;
+    row-gap: 6px;
   }
+  /* 按钮保持自身宽度：宁可换行，也不把「诊断报告」压成「诊断…」 */
+  .topbar button { flex: 0 0 auto; }
   .topbar input {
     flex: 1; padding: 5px 8px; background: var(--input-bg); color: var(--input-fg);
     border: 1px solid var(--input-border); border-radius: 3px; outline: none;
@@ -812,6 +1079,38 @@ export class PracticePanel {
   }
   .list-toggle:hover { color: var(--fg); background: rgba(128,128,128,.12); }
 
+  /* ---- 上下布局（窄窗口 / 侧边栏下左右布局太挤的替代方案）----
+   * DOM 顺序是 toggle → list → practice；竖排时用 order 重排成
+   *   操作区(1) → 开关条(2) → 字幕列表(3)
+   * 也就是：操作栏 → 紧贴它下方的开关条 → 字幕列表。
+   *
+   * 高度分配是这里最容易踩的坑（2026-09-19 用户明确要求）：
+   *   - 操作区 flex: 0 0 auto —— **永不压缩**：高度完全按内容走，
+   *     不出内部滚动条、不裁行。窗口很矮时宁可把列表压小，
+   *     也不能隐藏操作栏的功能。
+   *   - 列表 flex: 1 1 auto + min-height: 0 —— 吃掉剩余空间并【内部滚动】；
+   *     再配合 .main.stacked 的 overflow:hidden，字幕再长也不会撑破容器
+   *     （整页不出现滚动条，列表自己有右侧滚动条）。
+   *   - 收起时列表不占位，但操作区**保持原高度**（下方留白，不伸展）。
+   */
+  .main.stacked { flex-direction: column; overflow: hidden; }
+  .main.stacked .practice {
+    order: 1; flex: 0 0 auto;
+    border-bottom: 1px solid var(--border);
+  }
+  .main.stacked .list-toggle {
+    order: 2; width: auto; height: 14px; border-right: none;
+  }
+  .main.stacked .list {
+    order: 3; flex: 1 1 auto; min-height: 0;
+    /* 去掉列表自身的上下 padding：它是给左右布局留的，竖排下会让
+       列表在空间不足时最小高度卡在 8px，挤出几 px 无意义的溢出 */
+    padding: 0;
+    border-right: none;
+  }
+  .main.stacked.collapsed .list { display: none; }
+  .main.stacked.collapsed .practice { flex: 0 0 auto; }
+
   /* ---- 「发现 TED」视图 ---- */
   .discover { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
   .discover.visible { display: flex; }
@@ -832,6 +1131,21 @@ export class PracticePanel {
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .disc-card .m { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .disc-foot { display: flex; gap: 6px; justify-content: center; padding: 6px 0; }
+
+  /* ---- 卡片展开/下载按钮（改造后：点卡片只展开简介，下载要点按钮）---- */
+  .disc-card { align-items: flex-start; }
+  .disc-card.open { border-color: var(--accent); }
+  .disc-body { flex: 1 1 auto; min-width: 0; }
+  .disc-detail { margin-top: 6px; }
+  .disc-desc {
+    font-size: 11px; color: var(--muted); line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 132px; overflow-y: auto;
+  }
+  .disc-act { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .disc-act button { padding: 3px 8px; font-size: 11px; }
+  .disc-prog { font-size: 11px; color: var(--accent); white-space: nowrap; }
+  .disc-err { font-size: 11px; color: var(--err); margin-top: 4px; word-break: break-word; }
 
   /* ---- 「素材库」视图（已缓存素材）---- */
   .library { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
@@ -871,6 +1185,8 @@ export class PracticePanel {
   <button id="discoverBtn" class="ghost">发现 TED</button>
   <button id="libraryBtn" class="ghost">素材库</button>
   <button id="report" class="ghost">诊断报告</button>
+  <!-- 布局切换：只在精听界面显示（文案是「点了会切到哪种布局」） -->
+  <button id="layoutBtn" class="ghost" style="display:none">⇅ 上下布局</button>
 </div>
 
 <div id="root" class="visible">
@@ -976,7 +1292,25 @@ let state = {
   rate: 1,
   loop: false,
   listCollapsed: false,
+  // 布局：false = 左字幕 / 右操作（默认）；true = 上操作 / 下字幕
+  stacked: false,
 };
+
+// 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
+// getState/setState 是 acquireVsCodeApi() 的标准能力，但桩环境里可能没有，
+// 所以都要判类型 + try（历史上页面脚本一旦抛错就是整页按钮全部失效）。
+try {
+  if (typeof vscode.getState === 'function') {
+    const saved = vscode.getState();
+    if (saved && typeof saved.stacked === 'boolean') state.stacked = saved.stacked;
+  }
+} catch (e) { /* 取不到就用默认布局 */ }
+
+function saveLayout() {
+  try {
+    if (typeof vscode.setState === 'function') vscode.setState({ stacked: state.stacked });
+  } catch (e) { /* 存不了不影响使用 */ }
+}
 
 document.getElementById('load').onclick = () => {
   const v = document.getElementById('url').value.trim();
@@ -991,9 +1325,21 @@ window.addEventListener('message', (e) => {
   const msg = e.data;
   if (msg.type === 'material') { state.material = msg.material; state.currentIndex = 0; render(); }
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
-  if (msg.type === 'progress') { showProgress(msg.message, msg.percent); }
-  if (msg.type === 'done') { render(); }
-  if (msg.type === 'error') { showError(msg.message); }
+  // ★ 下载来源区分（2026-09-19）：
+  //   - 「发现 TED」列表里点「下载」→ 进度/错误只更新那张卡片，页面留在列表
+  //   - 粘贴链接等入口 → 照旧切到练习视图显示全局进度
+  if (msg.type === 'progress') {
+    if (msg.origin === 'discover') onDiscProgress(msg);
+    else { showProgress(msg.message, msg.percent); showPracticeView(); }
+  }
+  if (msg.type === 'done') {
+    // 列表下载的收尾由 tedDownloaded 完成（它带真实目录名），这里不切视图
+    if (msg.origin !== 'discover') { render(); showPracticeView(); }
+  }
+  if (msg.type === 'error') {
+    if (msg.origin === 'discover') onDiscError(msg);
+    else { showError(msg.message, msg.hint); showPracticeView(); }
+  }
   if (msg.type === 'report') { renderReport(msg.report); }
   if (msg.type === 'audioBytes') { onAudioBytes(msg); }
   if (msg.type === 'pausePlayback') {
@@ -1001,6 +1347,19 @@ window.addEventListener('message', (e) => {
     try { player.pause(); } catch (err) { /* 未初始化时忽略 */ }
   }
   if (msg.type === 'tedResults') { onTedResults(msg); }
+  if (msg.type === 'talkInfo') {
+    discState.info[msg.slug] = msg.error
+      ? { error: msg.error }
+      : { description: msg.description, presenter: msg.presenter, durationMs: msg.durationMs };
+    if (discState.expanded[msg.slug]) renderDiscList();
+  }
+  if (msg.type === 'tedDownloaded') {
+    // 下载完成：这张卡片标成「已下载」（目录名由宿主给，页面不猜命名规则）。
+    // 对齐键是 slug —— 见 discCachedDir 的注释（搜索结果的 id 与素材 id 不同源）。
+    if (msg.slug) discState.cached[msg.slug] = msg.dirName;
+    if (msg.slug) delete discState.download[msg.slug];
+    if (discState.hits.length) renderDiscList();
+  }
   if (msg.type === 'cachedList') { onCachedList(msg); }
   if (msg.type === 'materialRemoved') {
     // 正在练习的素材被删除：停播并清空界面
@@ -1010,10 +1369,15 @@ window.addEventListener('message', (e) => {
     root.innerHTML =
       '<div class="center">该素材已被删除。<br>从「发现 TED」加载新素材，或在「素材库」选择其他素材继续。</div>';
   }
-  // 加载流程开始/结束时都要回到练习视图（「发现 TED」只是浏览入口）
-  if (msg.type === 'progress' || msg.type === 'done' || msg.type === 'error') {
-    showPracticeView();
+  if (msg.type === 'deleted') {
+    // 只有宿主确认删除后才会发这条 —— 用户取消时不会发，界面保持原状。
+    // 删除完成宿主还会推 cachedList，届时用新列表重渲染。
+    libState.multi = false;
+    libState.selected = {};
+    renderLib();
   }
+  // 注意：视图切换已在上面按 progress/done/error 的来源分别处理，
+  // 不要再在这里统一 showPracticeView() —— 那会把列表里的下载进度打断。
 });
 
 /* ---------------- 「发现 TED」浏览/搜索 ---------------- */
@@ -1027,7 +1391,22 @@ const discMeta = document.getElementById('discMeta');
 const discFoot = document.getElementById('discFoot');
 const discQuery = document.getElementById('discQuery');
 const discSort = document.getElementById('discSort');
-let discState = { sort: 'popular', query: '', page: 0, nbPages: 0, reqId: 0, loading: false };
+let discState = {
+  sort: 'popular', query: '', page: 0, nbPages: 0, reqId: 0, loading: false,
+  // 当前页结果
+  hits: [],
+  // 已下载清单：素材 id('ted:66') → 目录名。由宿主随搜索结果给出，
+  // 数据源就是素材库那套 scanCached()，删改后自然一致
+  cached: {},
+  // slug → true（展开简介）
+  expanded: {},
+  // slug → { loading } | { description, presenter, durationMs } | { error }
+  info: {},
+  // ⚠️ 简介请求单独计数：不能复用 reqId，否则会把在途的搜索结果误判为过期
+  infoReq: 0,
+  // talkId → { percent, message, error }（下载中）
+  download: {},
+};
 
 /* 三视图统一切换：practice / discover / library 互斥显示 */
 const viewEls = {
@@ -1036,13 +1415,31 @@ const viewEls = {
   library: libView,
 };
 let currentView = 'practice';
+// 诊断报告会占用 #root，但它不算「精听界面」——布局按钮此时要藏起来
+let reportMode = false;
+
+const layoutBtn = document.getElementById('layoutBtn');
+
+/** 布局按钮：只在精听界面显示，文案写「点了会切到哪种布局」 */
+function updateLayoutBtn() {
+  layoutBtn.style.display = currentView === 'practice' && !reportMode ? '' : 'none';
+  layoutBtn.textContent = state.stacked ? '⇄ 左右布局' : '⇅ 上下布局';
+}
+
 function showView(name) {
   currentView = name;
   for (const k of Object.keys(viewEls)) {
     viewEls[k].classList.toggle('visible', k === name);
   }
+  updateLayoutBtn();
 }
 function showPracticeView() { showView('practice'); }
+
+layoutBtn.onclick = () => {
+  state.stacked = !state.stacked;
+  saveLayout();
+  render();
+};
 
 document.getElementById('discoverBtn').onclick = () => {
   if (currentView === 'discover') { showView('practice'); return; }
@@ -1074,6 +1471,161 @@ function discLoad(page) {
   });
 }
 
+/**
+ * 该 talk 在素材库里的目录名（空串 = 未下载）。key 是 slug。
+ *
+ * ⚠️ 为什么整张列表都用 slug 而不是 id 对齐：
+ *   搜索结果的 hit.id 是 Algolia 的 objectID（实测 3292），
+ *   素材库的 id 是 ted:<videoData.id>（实测 ted:66）—— **两者不同源**，
+ *   按 id 对齐时「已下载」永远标不上、下载完也永远不更新（2026-09-19 实测）。
+ *   slug 是搜索结果与素材 sourceUrl 之间唯一稳定的公共字段。
+ */
+function discCachedDir(slug) {
+  return discState.cached[slug] || '';
+}
+
+/** 展开区的内容：简介（按需从宿主取，搜索接口不带简介） */
+function discDetailHtml(slug) {
+  const info = discState.info[slug];
+  if (!info || info.loading) return '简介加载中…';
+  if (info.error) return '取简介失败：' + esc(info.error);
+  return esc(info.description || '（这次演讲没有简介）');
+}
+
+/**
+ * 渲染当前页卡片。
+ *
+ * 交互（2026-09-19 明确）：
+ *   - 点卡片主体 = 展开/收起简介，**不再直接触发下载**
+ *   - 下载必须点右侧的「下载」按钮
+ *   - 素材库里已有（含音频）→ 显示「已下载」徽标，按钮变「练习」
+ *   - 下载中 → 右侧显示百分比，且页面留在列表不切走
+ */
+function renderDiscList() {
+  if (!discState.hits.length) return;
+
+  discList.innerHTML = discState.hits.map((h) => {
+    const dirName = discCachedDir(h.slug);
+    const dl = discState.download[h.slug];
+    const open = !!discState.expanded[h.slug];
+    const img = h.thumb
+      ? '<img src="' + esc(h.thumb) + '" loading="lazy">'
+      : '<img src="" style="visibility:hidden">';
+
+    let act;
+    if (dl && !dl.error) {
+      act = '<span class="disc-prog" data-role="prog">' +
+        Math.round(dl.percent || 0) + '%</span>';
+    } else if (dirName) {
+      act = '<button class="disc-go" data-dirname="' + esc(dirName) + '">练习</button>';
+    } else {
+      act = '<button class="disc-dl" data-slug="' + esc(h.slug) + '">下载</button>';
+    }
+
+    const badge = dirName ? '<span class="badge ok">已下载</span>' : '';
+    const err = dl && dl.error ? '<div class="disc-err">下载失败：' + esc(dl.error) + '</div>' : '';
+
+    return '<div class="disc-card' + (open ? ' open' : '') +
+        '" data-slug="' + esc(h.slug) + '" data-id="' + esc(h.id) + '">' +
+      img +
+      '<div class="disc-body">' +
+        '<div class="t">' + esc(h.title) + '</div>' +
+        '<div class="m">' + esc(h.speakers || '') +
+          ' · ' + Math.round(h.durationSec / 60) + ' 分钟 ' + badge + '</div>' +
+        '<div class="disc-detail"' + (open ? '' : ' style="display:none"') + '>' +
+          '<div class="disc-desc">' + discDetailHtml(h.slug) + '</div>' +
+        '</div>' +
+        err +
+      '</div>' +
+      '<div class="disc-act">' + act + '</div>' +
+    '</div>';
+  }).join('');
+
+  discList.querySelectorAll('.disc-card').forEach((el) => {
+    el.onclick = (ev) => {
+      if (ev.target.closest('button')) return; // 按钮各司其职
+      toggleDiscDetail(el.dataset.slug);
+    };
+  });
+  discList.querySelectorAll('.disc-dl').forEach((el) => {
+    el.onclick = (ev) => { ev.stopPropagation(); startDiscDownload(el); };
+  });
+  discList.querySelectorAll('.disc-go').forEach((el) => {
+    el.onclick = (ev) => {
+      ev.stopPropagation();
+      showView('practice');
+      vscode.postMessage({ type: 'openCached', dirName: el.dataset.dirname });
+    };
+  });
+}
+
+/** 展开/收起简介；首次展开才向宿主取简介 */
+function toggleDiscDetail(slug) {
+  if (!slug) return;
+  if (discState.expanded[slug]) {
+    delete discState.expanded[slug];
+    renderDiscList();
+    return;
+  }
+  discState.expanded[slug] = true;
+  if (!discState.info[slug]) {
+    const hit = discState.hits.find((x) => x.slug === slug);
+    discState.info[slug] = { loading: true };
+    vscode.postMessage({
+      type: 'talkInfo',
+      reqId: ++discState.infoReq,
+      slug: slug,
+      id: hit ? hit.id : '',
+    });
+  }
+  renderDiscList();
+}
+
+/** 点「下载」：只有这里才会真正触发下载 */
+function startDiscDownload(btn) {
+  const slug = btn.dataset.slug;
+  if (!slug) return;
+  if (discState.download[slug]) return;   // 下载中，忽略重复点击
+  discState.download[slug] = { percent: 0, message: '准备中' };
+  renderDiscList();
+  vscode.postMessage({
+    type: 'loadTedUrl',
+    url: 'https://www.ted.com/talks/' + slug,
+    slug: slug,
+  });
+}
+
+/** 下载进度：只改那一张卡片的百分比，不整表重渲染（进度消息很密集） */
+function onDiscProgress(msg) {
+  const slug = msg.slug;
+  if (!slug || !discState.download[slug]) return;
+  discState.download[slug].percent = msg.percent;
+  discState.download[slug].message = msg.message;
+  const card = discList.querySelector('.disc-card[data-slug="' + slug + '"]');
+  const el = card ? card.querySelector('[data-role="prog"]') : null;
+  if (el) el.textContent = Math.round(msg.percent || 0) + '%';
+}
+
+/** 下载失败：错误显示在卡片上（用户还在列表里操作） */
+function onDiscError(msg) {
+  const slug = msg.slug;
+  if (!slug || !discState.download[slug]) {
+    showError(msg.message, msg.hint);
+    showPracticeView();
+    return;
+  }
+  discState.download[slug].error = msg.message;
+  renderDiscList();
+}
+
+/** 素材库数据变了（删除/新增）→ 同步「已下载」标注（按 slug 对齐） */
+function syncDiscCached(items) {
+  const map = {};
+  items.forEach((it) => { if (it.hasAudio && it.slug) map[it.slug] = it.dirName; });
+  discState.cached = map;
+  if (discState.hits.length) renderDiscList();
+}
+
 function onTedResults(msg) {
   if (msg.reqId !== discState.reqId) return; // 只认最新一次请求
   discState.loading = false;
@@ -1083,34 +1635,18 @@ function onTedResults(msg) {
   discMeta.textContent = '共 ' + msg.nbHits + ' 个演讲 · 第 ' + (msg.page + 1) + ' / ' +
     msg.nbPages + ' 页';
 
-  const hits = msg.hits || [];
-  if (!hits.length) {
+  // 已下载清单由宿主随结果一起给（见 panel.ts 的 case 'tedSearch'），按 slug 索引
+  discState.cached = {};
+  (msg.cached || []).forEach((c) => { if (c.slug) discState.cached[c.slug] = c.dirName; });
+  discState.hits = msg.hits || [];
+  discState.download = {};   // 换页/重搜后清掉上一轮残留
+
+  if (!discState.hits.length) {
     discList.innerHTML = '<div class="center" style="padding:20px">没有匹配的演讲</div>';
     discFoot.innerHTML = '';
     return;
   }
-
-  discList.innerHTML = hits.map((h) => {
-    const img = h.thumb
-      ? '<img src="' + esc(h.thumb) + '" loading="lazy">'
-      : '<img src="" style="visibility:hidden">';
-    return '<div class="disc-card" data-slug="' + esc(h.slug) + '">' + img +
-      '<div><div class="t">' + esc(h.title) + '</div>' +
-      '<div class="m">' + esc(h.speakers || '') +
-      ' · ' + Math.round(h.durationSec / 60) + ' 分钟</div></div></div>';
-  }).join('');
-
-  discList.querySelectorAll('.disc-card').forEach((el) => {
-    el.onclick = () => {
-      const slug = el.dataset.slug;
-      if (!slug) return;
-      showPracticeView();
-      vscode.postMessage({
-        type: 'loadTedUrl',
-        url: 'https://www.ted.com/talks/' + slug,
-      });
-    };
-  });
+  renderDiscList();
 
   let foot = '';
   if (msg.page > 0) foot += '<button class="ghost" id="discPrev">上一页</button>';
@@ -1137,8 +1673,20 @@ discSort.addEventListener('change', () => {
 
 /* ---------------- 「素材库」：已缓存素材 ---------------- */
 
-let libState = { multi: false, selected: {} as Record<string, boolean> };
+// ⚠️ 这一段是「模板字符串里的 webview JS 源码」，tsc 不会对它做类型擦除！
+//    这里绝不能出现 as Xxx、类型注解等 TS 专有语法 ——
+//    它们会原样留在生成的页面里 -> SyntaxError -> 整个 script 标签报废
+//    -> 所有按钮（含「发现 TED」）全部点不动，且编辑器里毫无报错。
+//    历史事故：写成 {} as Record<string, boolean>，症状即「点击发现 TED 没反应」。
+//    注意本段不要使用反引号（会提前终止外层模板字符串），也不要写单反斜杠 n。
+let libState = { multi: false, selected: {} };
 let lastCachedItems = [];
+
+// 用目录名找出素材标题，供宿主的确认框显示（拿不到就退回目录名）
+function libTitleOf(dirName) {
+  const it = lastCachedItems.find((x) => x.dirName === dirName);
+  return it && it.title ? it.title : dirName;
+}
 
 function renderLibBar() {
   const bar = document.getElementById('libBar');
@@ -1149,10 +1697,15 @@ function renderLibBar() {
     document.getElementById('libDoDelete').onclick = () => {
       const names = Object.keys(libState.selected);
       if (!names.length) return;
-      if (!window.confirm('确定删除所选 ' + names.length + ' 个素材？\\n其音频缓存将一并删除，不可恢复。')) return;
-      libState.multi = false;
-      libState.selected = {};
-      vscode.postMessage({ type: 'deleteCached', dirNames: names });
+      // ⚠️ 不要用 window.confirm 做确认：webview 是 sandboxed iframe，
+      //    Chromium 会忽略它并恒返回 false —— 表现为「点了删除没反应」。
+      //    确认一律交给宿主（vscode.window.showWarningMessage modal）。
+      // 多选状态等宿主的 deleted 消息回来再清，用户取消时界面保持原状。
+      vscode.postMessage({
+        type: 'deleteCached',
+        dirNames: names,
+        titles: names.map(libTitleOf),
+      });
     };
     document.getElementById('libCancelMulti').onclick = () => {
       libState.multi = false;
@@ -1170,10 +1723,11 @@ function renderLibBar() {
     };
     document.getElementById('libDeleteAll').onclick = () => {
       if (!lastCachedItems.length) return;
-      if (!window.confirm('确定删除全部 ' + lastCachedItems.length + ' 个素材？\\n其音频缓存将一并删除，不可恢复。')) return;
+      // 确认由宿主弹出（原因见 libDoDelete）
       vscode.postMessage({
         type: 'deleteCached',
         dirNames: lastCachedItems.map((it) => it.dirName),
+        titles: lastCachedItems.map((it) => it.title),
       });
     };
   }
@@ -1182,6 +1736,8 @@ function renderLibBar() {
 function onCachedList(msg) {
   if (msg.error) { libMeta.textContent = '读取缓存失败：' + msg.error; return; }
   lastCachedItems = msg.items || [];
+  // 素材库是最新的磁盘事实 —— 顺带同步「发现 TED」的已下载标注
+  syncDiscCached(lastCachedItems);
   renderLibBar();
 
   if (!lastCachedItems.length) {
@@ -1228,8 +1784,8 @@ function onCachedList(msg) {
     el.onclick = (ev) => {
       ev.stopPropagation();
       const dn = el.dataset.dirname;
-      if (!window.confirm('确定删除该素材？\\n其音频缓存将一并删除，不可恢复。')) return;
-      vscode.postMessage({ type: 'deleteCached', dirNames: [dn] });
+      // 确认由宿主弹出（原因见 libDoDelete）
+      vscode.postMessage({ type: 'deleteCached', dirNames: [dn], titles: [libTitleOf(dn)] });
     };
   });
 }
@@ -1248,12 +1804,16 @@ function showProgress(text, percent) {
     '</div></div>';
 }
 
-function showError(text) {
+// hint 由宿主按错误类型给（缓存类错误不该把人引去配代理）；
+// 不传时退回网络排查提示。
+function showError(text, hint) {
   root.innerHTML =
     '<div class="center"><div style="max-width:460px;margin:0 auto;">' +
     '<div style="color:var(--err);margin-bottom:6px;">加载失败</div>' +
     '<div class="hint">' + esc(text) + '</div>' +
-    '<div class="hint" style="margin-top:12px;">如果是网络问题，请在设置中配置 listeningTrainer.proxy</div>' +
+    '<div class="hint" style="margin-top:12px;">' +
+      esc(hint || '如果是网络问题，请在设置中配置 listeningTrainer.proxy') +
+    '</div>' +
     '</div></div>';
 }
 
@@ -1275,16 +1835,22 @@ function render() {
   const m = state.material;
   if (!m) return;
 
+  // 左右布局用 « »，上下布局用 ▴ ▾（朝向跟着布局走，不然会看不懂）
+  const toggleArrow = state.stacked
+    ? (state.listCollapsed ? '▾' : '▴')
+    : (state.listCollapsed ? '»' : '«');
+
   root.innerHTML =
     '<div class="meta">' +
       '<h2>' + esc(m.title) + '</h2>' +
       '<div class="sub">' + esc(m.presenter || '') + ' · ' + m.sentences.length + ' 句 · ' +
         fmtTime(m.durationMs) + '</div>' +
     '</div>' +
-    '<div class="main' + (state.listCollapsed ? ' collapsed' : '') + '">' +
+    '<div class="main' + (state.listCollapsed ? ' collapsed' : '') +
+      (state.stacked ? ' stacked' : '') + '">' +
       '<div class="list-toggle" id="listToggle" title="' +
         (state.listCollapsed ? '展开字幕列表' : '收起字幕列表') + '">' +
-        (state.listCollapsed ? '»' : '«') + '</div>' +
+        toggleArrow + '</div>' +
       '<div class="list" id="list"></div>' +
       '<div class="practice" id="practice"></div>' +
     '</div>';
@@ -1297,6 +1863,9 @@ function render() {
     state.listCollapsed = !state.listCollapsed;
     render();
   };
+
+  reportMode = false;   // 这一函数画的就是精听界面
+  updateLayoutBtn();
 }
 
 function renderList() {
@@ -2039,6 +2608,10 @@ function renderReport(rep) {
       ) +
       '<div style="margin-top:16px"><button id="back" class="ghost">返回练习</button></div>' +
     '</div>';
+
+  // 报告占用了 #root，但这不是精听界面 —— 布局按钮要收起来
+  reportMode = true;
+  updateLayoutBtn();
 
   const back = document.getElementById('back');
   if (back) back.onclick = render;

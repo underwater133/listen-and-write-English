@@ -37,6 +37,15 @@ export interface TranscodeOptions {
   /** MP3 码率，默认 128 kbps（语音够用，体积与源相当） */
   bitrateKbps?: number;
   log?: (msg: string) => void;
+  /**
+   * 进度回调（ratio 0~1，label 为子阶段说明）。
+   *
+   * ⚠️ 为什么不报进度就等于「UI 卡死」：
+   *    编码循环是同步的（8MB 音频实测 22.7s），整段期间扩展宿主的事件循环
+   *    被完全占住 —— 不但进度发不出去，连 postMessage 都送不到 webview。
+   *    所以进度上报必须与「周期性让出事件循环」配套，见下方 await。
+   */
+  onProgress?: (ratio: number, label: string) => void;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -141,7 +150,12 @@ export async function transcodeToMp3(
   const vpath = `/src-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.m4a`;
   await libav.writeFile(vpath, new Uint8Array(srcAac));
 
+  // 进度刻度：解码很快（0.76s），耗时几乎全在编码（22.7s），
+  // 所以前 10% 给「写入/解封装/解码」，后 90% 给编码。
+  const onProgress = opts.onProgress;
+
   // 1) 解封装
+  onProgress?.(0.02, '解封装容器');
   const [fmtCtx, streams] = await libav.ff_init_demuxer_file(vpath);
   if (!streams || !streams.length) throw new Error('转码失败：没找到音频流');
   const st = streams[0];
@@ -163,6 +177,7 @@ export async function transcodeToMp3(
 
   // 4) 解码全部帧
   const t0 = Date.now();
+  onProgress?.(0.05, '解码 AAC');
   const frames = await libav.ff_decode_multi(dec, pkt, frame, pktList, true);
   if (!frames || !frames.length) throw new Error('转码失败：解码后没有音频帧');
 
@@ -175,6 +190,8 @@ export async function transcodeToMp3(
   const enc = new lamejs.Mp3Encoder(channels, sampleRate, kbps);
   const chunks: Buffer[] = [];
   const t1 = Date.now();
+  // 约 40 次进度回调；同时也是「让出事件循环」的间隔
+  const tickEvery = Math.max(1, Math.ceil(frames.length / 40));
   for (let fi = 0; fi < frames.length; fi++) {
     const f = frames[fi];
     const L = f.data[0];
@@ -197,6 +214,14 @@ export async function transcodeToMp3(
     }
     // ⚠️ encodeBuffer 返回 Int8Array，不能 Buffer.from(int8)（会把负数按值转成 255+）
     if (buf.length) chunks.push(Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength));
+
+    if (fi % tickEvery === 0) {
+      onProgress?.(0.1 + 0.9 * (fi / frames.length), '编码 MP3');
+      // ★ 必须让出事件循环。
+      //   这段循环是同步的，不让出的话扩展宿主整段时间被独占：
+      //   进度消息发不出去、其他命令也全部挂起，UI 表现为「卡住不动」。
+      await new Promise((r) => setImmediate(r));
+    }
   }
   const tail = enc.flush();
   if (tail.length) chunks.push(Buffer.from(tail.buffer, tail.byteOffset, tail.byteLength));

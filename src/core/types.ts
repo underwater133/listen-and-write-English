@@ -5,6 +5,9 @@
  * 与具体素材源无关。新增源 = 新增一个 MaterialSourceAdapter 实现。
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 /* ------------------------------------------------------------------ */
 /* 统一模型                                                            */
 /* ------------------------------------------------------------------ */
@@ -117,6 +120,39 @@ export interface AudioInfo {
   cacheVersion?: number;
 }
 
+/**
+ * 按素材目录重新定位音频文件，返回可用路径；找不到返回 null。
+ *
+ * ⚠️ audio.json 里的 path 是【写入时的绝对路径】。素材目录一旦整体搬迁
+ *    （`listeningTrainer.materialsDir` 变更时扩展会自动搬运），旧路径必然失效：
+ *      - panel.openCached 判 existsSync(path) 失败 → 误报「音频缓存已过期」
+ *      - panel.tryRestoreLast 的 readFileSync 抛错被 catch → 素材被静默跳过
+ *      - 就算判据放行，推给 webview 的 audioUri 也指向不存在的旧位置 → 播放失败
+ *    （2026-09-19 实测：配置 materialsDir 后点素材库的卡片必现）
+ *
+ * 目录名不变，所以「同目录 + 候选文件名」重定位是正确且幂等的。
+ * 一律用 path.basename 取名字，杜绝 ".." 之类的越界拼接。
+ */
+export function relocateAudioPath(dir: string, info: AudioInfo): string | null {
+  // 常规情况：路径没变，直接可用
+  if (info.path && fs.existsSync(info.path)) return info.path;
+
+  const candidates: string[] = [];
+  // 1) 沿用原文件名（迁移只换目录，文件名通常不变）
+  if (info.path) candidates.push(path.basename(info.path));
+  // 2) 按 format 推断的约定名
+  const ext = info.format === 'aac' ? 'aac' : info.format === 'm4a' ? 'm4a' : 'mp3';
+  candidates.push(`audio.${ext}`);
+  // 3) v5 起的最终产物（旧记录 format 缺失时的兜底）
+  candidates.push('audio.mp3');
+
+  for (const name of candidates) {
+    const p = path.join(dir, name);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 export interface ListeningMaterial {
   /** `${source}:${sourceId}` */
   id: string;
@@ -138,6 +174,39 @@ export interface ListeningMaterial {
   fetchedAt: number;
 }
 
+/* ------------------------------------------------------------------ */
+/* 音频获取进度                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * ⚠️ 为什么进度不能只有 (done, total)：
+ *
+ * 分片下载完之后还有三段**本地计算**：解封装 TS → 封装 MP4 → AAC 解码 → MP3 编码。
+ * 实测 8MB / 500s 的 TED 音频，下载完只要几秒，而转码要 20~30s（编码占 22.7s）。
+ *
+ * 只报分片数的话，UI 会长期停在「下载音频 192/192」——用户看到的是「卡住了」，
+ * 实际在转码。（2026-09-19 实际观感反馈）
+ */
+export type AudioStage =
+  /** 并发下载分片 */
+  | 'download'
+  /** 逐片 MPEG-TS 解封装 */
+  | 'demux'
+  /** 封装 + AAC 解码 + MP3 编码（耗时主体） */
+  | 'transcode';
+
+export interface AudioProgress {
+  stage: AudioStage;
+  /** 已完成分片数（仅 download 阶段有意义） */
+  done: number;
+  /** 总分片数 */
+  total: number;
+  /** 当前阶段内的完成比例 0~1 */
+  ratio: number;
+  /** 可直接上屏给用户看的一句话 */
+  message: string;
+}
+
 /** 素材源适配器 —— 新增源只需实现此接口 */
 export interface MaterialSourceAdapter {
   readonly source: MaterialSource;
@@ -145,10 +214,10 @@ export interface MaterialSourceAdapter {
   canHandle(input: string): boolean;
   /** 拉元数据 + 字幕（不下载音频） */
   fetchMetadata(input: string, cacheDir: string): Promise<ListeningMaterial>;
-  /** 下载音频并解封装，返回补充了 audio 字段的 material */
+  /** 下载音频并解封装/转码，返回补充了 audio 字段的 material */
   fetchAudio(
     material: ListeningMaterial,
-    onProgress?: (done: number, total: number) => void
+    onProgress?: (p: AudioProgress) => void
   ): Promise<ListeningMaterial>;
 }
 

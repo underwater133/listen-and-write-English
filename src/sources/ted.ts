@@ -22,6 +22,7 @@ import {
   ListeningMaterial,
   MaterialSourceAdapter,
   MaterialSource,
+  AudioProgress,
   Sentence,
   TedNextData,
   TedStreamMetadata,
@@ -208,7 +209,7 @@ export class TedSource implements MaterialSourceAdapter {
 
   async fetchAudio(
     material: ListeningMaterial,
-    onProgress?: (done: number, total: number) => void
+    onProgress?: (p: AudioProgress) => void
   ): Promise<ListeningMaterial> {
     const cacheDir = material.cacheDir;
     const metaPath = path.join(cacheDir, 'material.json');
@@ -235,8 +236,28 @@ export class TedSource implements MaterialSourceAdapter {
           // v5 起最终产物必须是 MP3 —— VS Code 没有 AAC 解码器
           this.log(`缓存格式不是 MP3（${info.format}），重新转码`);
         } else if (isValidMp3(fs.readFileSync(mp3Path))) {
+          // ★ audio.json 里的 path 是写入时的绝对路径。素材目录被整体迁移过
+          //   （materialsDir 变更会自动搬运）就指向旧位置，复用时会把这个坏路径
+          //   一路带到 webview 的 audioUri 上 → 播放静默失败。
+          //   这里一律按当前目录修正，并写回磁盘（自愈，免得下游再踩一次）。
+          if (info.path !== mp3Path) {
+            this.log(`修正 audio.json 里的音频路径：${info.path} → ${mp3Path}`);
+            info.path = mp3Path;
+            try {
+              fs.writeFileSync(infoPath, JSON.stringify(info, null, 2), 'utf8');
+            } catch {
+              /* 写回失败不影响本次复用 */
+            }
+          }
           this.log(`复用缓存音频：${(info.bytes / 1024 / 1024).toFixed(2)}MB (MP3)`);
-          return { ...material, audio: info, status: 'ready' };
+          // ⚠️ 命中缓存这条路径也必须钳制时间轴！
+          //    这里拿到的 material.sentences 是刚抓下来的 VTT（未钳制），
+          //    直接返回就绕过了函数末尾的 clampSentencesToAudio。
+          //    实测（2026-09-19）：末句 end=499868ms 而音频只有 499670ms，
+          //    超界 198ms —— UI 会 seek 到不存在的区间（第 7 节那个坑的变体）。
+          //    判据单一来源：钳制只在这一层做，调用方一律读返回值的 .sentences。
+          const clamped = clampSentencesToAudio(material.sentences, info.durationMs);
+          return { ...material, sentences: clamped, audio: info, status: 'ready' };
         } else {
           this.log('缓存 MP3 校验失败，重新转码');
         }
@@ -297,7 +318,13 @@ export class TedSource implements MaterialSourceAdapter {
     const buffers = await mapLimit(segments, this.opts.concurrency, async (seg) => {
       const buf = await httpGetBuffer(seg.url, { proxy: this.opts.proxy });
       done++;
-      onProgress?.(done, segments.length);
+      onProgress?.({
+        stage: 'download',
+        done,
+        total: segments.length,
+        ratio: done / segments.length,
+        message: `下载音频 ${done}/${segments.length}`,
+      });
       return buf;
     });
 
@@ -309,6 +336,8 @@ export class TedSource implements MaterialSourceAdapter {
     let channels = 2;
     let totalFrames = 0;
 
+    // 解封装是同步计算（分片多时会有可感知的停顿），按约 10% 的粒度上报
+    const demuxTick = Math.max(1, Math.ceil(buffers.length / 10));
     for (let i = 0; i < buffers.length; i++) {
       try {
         const r = demuxTsToAac(buffers[i]);
@@ -318,6 +347,15 @@ export class TedSource implements MaterialSourceAdapter {
         totalFrames += r.frameCount;
       } catch (e) {
         this.log(`分片 ${i} 解封装跳过：${(e as Error).message}`);
+      }
+      if (i % demuxTick === 0) {
+        onProgress?.({
+          stage: 'demux',
+          done: i,
+          total: buffers.length,
+          ratio: i / buffers.length,
+          message: `解封装音频 ${i + 1}/${buffers.length}`,
+        });
       }
     }
 
@@ -370,7 +408,23 @@ export class TedSource implements MaterialSourceAdapter {
     }
 
     this.log('开始 AAC → MP3 转码（首次较慢，之后走缓存）');
-    const mp3 = await transcodeToMp3(packed.mp4, { bitrateKbps: 128, log: (m) => this.log(m) });
+    // 转码是本流程最耗时的一段（实测编码 22.7s / 8MB）。
+    // 若不单独上报阶段，UI 会一直停在「下载音频 N/N」——看起来就是卡死了。
+    const reportTranscode = (ratio: number, label: string) => {
+      onProgress?.({
+        stage: 'transcode',
+        done: 0,
+        total: buffers.length,
+        ratio,
+        message: `转码 MP3 ${Math.round(ratio * 100)}% · ${label}`,
+      });
+    };
+    reportTranscode(0, '准备中');
+    const mp3 = await transcodeToMp3(packed.mp4, {
+      bitrateKbps: 128,
+      log: (m) => this.log(m),
+      onProgress: reportTranscode,
+    });
     if (mp3.frameCount !== packed.frameCount) {
       this.log(`⚠️ 转码前后帧数不一致：MP4 ${packed.frameCount}，MP3 ${mp3.frameCount}`);
     }

@@ -16,6 +16,9 @@
 
 const SEARCH_URL = 'https://www.ted.com/api/search';
 
+/** 每页条数（列表卡片较高，10 条一屏正好） */
+export const PAGE_SIZE = 10;
+
 export type TedSort = 'relevance' | 'popular' | 'newest' | 'oldest';
 
 export interface TedHit {
@@ -116,7 +119,8 @@ export async function tedApiSearch(
         facets: ['subtitle_languages', 'tags'],
         highlightPostTag: '__/ais-highlight__',
         highlightPreTag: '__ais-highlight__',
-        hitsPerPage: 24,
+        // 每页 10 条：一屏能看完，翻页比长列表滚动更好定位（2026-09-19 调整）
+        hitsPerPage: PAGE_SIZE,
         maxValuesPerFacet: 500,
         page: Math.max(0, page | 0),
         query: query || '',

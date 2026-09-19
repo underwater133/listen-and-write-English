@@ -12,6 +12,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as vm from 'vm';
 
 let pass = 0;
 let fail = 0;
@@ -108,6 +109,110 @@ if (panelTpl) {
   check('自检器有效性：不误报好样本 join(双反斜杠 n)', allowsGood);
 }
 
+/* ---------- 生成物「能不能被解析」：整页报废类 bug 的唯一拦截点 ---------- */
+
+/**
+ * 把模板字符串按【运行时的方式】展开（转义序列真实生效）。
+ * 模板里只有一处插值 ${csp}，传占位值即可。
+ */
+function expandTemplate(tpl: string): string | null {
+  try {
+    return new Function('csp', 'return `' + tpl + '`;')('CSP-PLACEHOLDER') as string;
+  } catch {
+    return null;
+  }
+}
+
+/** 返回 JS 的语法错误信息；能解析则返回 null */
+function syntaxErrorOf(js: string): string | null {
+  try {
+    new vm.Script(js, { filename: 'webview-inline.js' });
+    return null;
+  } catch (e) {
+    return (e as Error).message;
+  }
+}
+
+if (panelTpl) {
+  const html = expandTemplate(panelTpl);
+  check('panel.ts: renderHtml 模板能展开成 HTML', !!html);
+
+  const inline = html ? html.match(/<script>([\s\S]*?)<\/script>/) : null;
+  check('panel.ts: 生成的页面里有内联 <script>', !!inline);
+
+  if (inline) {
+    const err = syntaxErrorOf(inline[1]);
+    check(
+      'panel.ts: 生成的 webview JS 能被解析（TS 语法 / 转义泄漏检测）',
+      err === null,
+      err === null ? undefined : err
+    );
+  }
+}
+
+// 反向自检：确认检测器真的能区分好坏样本。
+//
+// ★ 为什么必须做这一步：真实事故（2026-09-19）——
+//   panel.ts 模板里写了一行 `{} as Record<string, boolean>`。
+//   tsc 不对模板字符串内容做类型擦除，`as X` 原样进入页面 →
+//   SyntaxError: Unexpected identifier 'as' → 整个 <script> 不执行 →
+//   所有按钮（含「发现 TED」）点不动。而当时本文件 33 项自检【全绿】。
+//   只检测 \n 转义是不够的：TS 专有语法同样会整页报废。
+const probeTsLeak = 'var s = { multi: false, selected: {} as Record<string, boolean> };';
+check('自检器有效性：能抓到 TS 语法泄漏（as X）', syntaxErrorOf(probeTsLeak) !== null);
+check(
+  '自检器有效性：不误报合法 JS',
+  syntaxErrorOf('var s = { multi: false, selected: {} };') === null
+);
+// 反面样本 2：模板里写了单反斜杠 n → 展开后字符串被真实换行切断（README 第 13 节的坑）
+const BS = String.fromCharCode(92);
+const leakTpl = `var a = 'x${BS}n';`;
+const leakedJs = expandTemplate(leakTpl);
+check(
+  '自检器有效性：能抓到模板里单反斜杠 n 造成的断串',
+  leakedJs !== null && syntaxErrorOf(leakedJs) !== null
+);
+
+/* ---------- 被 webview 静默禁用的浏览器 API ---------- */
+
+/**
+ * ★ webview 里禁用 window.confirm / alert / prompt。
+ *
+ * 原因：VS Code 的 webview 是 sandboxed iframe，没有 allow-modals 标志。
+ * 按规范，Chromium 对 sandboxed iframe 会【忽略】这些 modal 调用 ——
+ * confirm() 直接返回 false（控制台只有一行 ignored 警告）。
+ *
+ * 真实事故（2026-09-19）：三处删除都写成
+ *     if (!window.confirm('确定删除…？')) return;
+ * 于是每次都提前 return，「删除 / 多选删除 / 全部删除」点了全部没反应，
+ * 页面不报错、宿主也收不到消息 —— 又是最难查的那种静默失效。
+ * 破坏性操作必须由宿主用 vscode.window.showWarningMessage({ modal: true }) 确认。
+ */
+function findModalCalls(src: string): string[] {
+  // 注释里允许描述这个坑（只要不写出完整调用形式），所以先剥块注释
+  const noComment = src.replace(/\/\*[\s\S]*?\*\//g, '');
+  return noComment.match(/\b(?:window\.)?(?:confirm|alert|prompt)\s*\(/g) ?? [];
+}
+
+if (panelTpl) {
+  const modalCalls = findModalCalls(panelTpl);
+  check(
+    'panel.ts: webview 内不使用 confirm/alert/prompt（被 Chromium 忽略，恒返回 false）',
+    modalCalls.length === 0,
+    modalCalls.length ? `发现 ${modalCalls.length} 处：${modalCalls.join(', ')}` : undefined
+  );
+
+  // 反向自检：确认检测器真能区分（不能是个永远返回 ✅ 的假检测器）
+  check(
+    '自检器有效性：能抓到 window.confirm 调用',
+    findModalCalls("if (!window.confirm('x')) return;").length === 1
+  );
+  check(
+    '自检器有效性：不误报仅提及名字的注释',
+    findModalCalls('/* 不要用 window.confirm 做确认 */').length === 0
+  );
+}
+
 /* ---------- CSP 与内联样式的一致性 ---------- */
 
 function cspOf(src: string): string {
@@ -157,6 +262,31 @@ check(
   /media-src[^\n]*blob:/.test(panel)
 );
 
+// ★ 页面级滚动必须锁死。
+// 真实事故（2026-09-19）：body 用 100vh，与 webview 实际可视高度差几像素，
+// 就会凭空多出一条【页面级】滚动条 —— 它与字幕列表无关，所以"收起列表后依然存在"，
+// 极易被误认为是列表的滚动条。滚动只应发生在各视图内部（.list / .discover / .library）。
+check(
+  'panel.ts: 页面本身禁止滚动（html / body 都 overflow:hidden）',
+  /html \{ overflow: hidden; \}/.test(panel) && /height: 100vh; overflow: hidden;/.test(panel),
+  '页面级滚动没锁死 —— 100vh 与可视高度的微小差会造出一条消不掉的页面滚动条'
+);
+check(
+  'panel.ts: 滚动条用 VS Code 样式（不要 Chromium 默认的粗黑条）',
+  /::-webkit-scrollbar \{ width: 10px/.test(panel) &&
+    /::-webkit-scrollbar-thumb \{ background: rgba\(121,121,121,\.4\)/.test(panel),
+  '用的是浏览器默认滚动条，看起来像页面被撑破了'
+);
+
+// 顶部工具栏 4 个按钮在侧边栏宽度下放不下一行：必须换行，否则被裁掉半截
+// （flex 默认 nowrap + 页面 overflow:hidden = 溢出的按钮直接消失）
+check(
+  'panel.ts: 顶部工具栏窄宽度下换行且按钮不被压缩',
+  /\.topbar \{[^}]*flex-wrap: wrap/.test(panel) &&
+    /\.topbar button \{ flex: 0 0 auto; \}/.test(panel),
+  'topbar 仍是不换行的 flex，窄宽度下按钮会被裁掉'
+);
+
 /* ---------- sidebar 一致性（它以纯 nonce 模式工作，前提是没有内联样式） ---------- */
 
 const sidebarCsp = cspOf(sidebar);
@@ -169,6 +299,89 @@ check(
 );
 
 /* ---------- 关键元素与容器 ---------- */
+
+/* ---------- 「发现 TED」显式下载 + 布局切换（2026-09-19 新增能力） ---------- */
+
+// 点卡片不再直接下载：下载必须走『下载』按钮（否则又变成"点一下就下载"）
+check(
+  'panel.ts: 发现列表有「下载」按钮与 startDiscDownload',
+  /class="disc-dl"/.test(panel) && /function startDiscDownload/.test(panel),
+  '缺少显式下载入口'
+);
+check(
+  'panel.ts: 发现列表会标注「已下载」徽标',
+  /已下载<\/span>|已下载' \+|>已下载</.test(panel),
+  '缺少已下载标注'
+);
+// 列表里下载时不能把页面切走：进度按 origin 分流
+check(
+  'panel.ts: 列表下载进度按 origin 分流（不切视图）',
+  /msg\.origin === 'discover'/.test(panel),
+  '缺少来源分流，列表下载会把页面切到练习视图'
+);
+check(
+  'panel.ts: 展开简介走 talkInfo 通道（搜索接口不带简介）',
+  /type: 'talkInfo'/.test(panel) && /case 'talkInfo'/.test(panel)
+);
+
+// 布局切换
+check('panel.ts: 顶部有布局切换按钮 #layoutBtn', /id="layoutBtn"/.test(panel));
+check('panel.ts: 布局按钮有点击绑定', /layoutBtn\.onclick/.test(panel));
+check(
+  'panel.ts: 布局按钮只在精听界面显示',
+  /function updateLayoutBtn/.test(panel) && /currentView === 'practice' && !reportMode/.test(panel),
+  '布局按钮的显隐没有跟视图绑定'
+);
+check('panel.ts: 有上下布局样式 .main.stacked', /\.main\.stacked \{/.test(panel));
+check(
+  'panel.ts: 上下布局排序为 操作区(1) → 收起条(2) → 字幕列表(3)',
+  /\.main\.stacked \.practice \{[^}]*order: 1/.test(panel) &&
+    /\.main\.stacked \.list-toggle \{[^}]*order: 2/.test(panel) &&
+    /\.main\.stacked \.list \{[^}]*order: 3/.test(panel),
+  '上下布局的排列顺序不对（收起条要在字幕列表上方）'
+);
+check(
+  'panel.ts: 上下布局的字幕列表不会撑破容器',
+  /\.main\.stacked \{ flex-direction: column; overflow: hidden; \}/.test(panel) &&
+    /\.main\.stacked \.list \{[^}]*flex: 1 1 auto; min-height: 0/.test(panel),
+  '列表没限制在容器内，长字幕会把整页撑出滚动条'
+);
+check(
+  'panel.ts: 上下布局的操作栏永不压缩（flex: 0 0 auto 且不设 max-height）',
+  /\.main\.stacked \.practice \{[^}]*flex: 0 0 auto/.test(panel) &&
+    !/\.main\.stacked \.practice \{[^}]*max-height/.test(panel),
+  '操作栏被压缩或加了 max-height —— 会出内部滚动条/裁行，等于隐藏了部分功能'
+);
+check(
+  'panel.ts: 上下布局收起列表后操作栏不伸展（下方留白）',
+  /\.main\.stacked\.collapsed \.practice \{ flex: 0 0 auto; \}/.test(panel),
+  '收起后操作栏伸展了，与「保持原高度」的约定不符'
+);
+
+// ★ 回归防线：「已下载」必须按 slug 对齐。
+// 真实事故（2026-09-19）：搜索结果 hit.id 是 Algolia objectID（3292），
+// 素材库 id 是 ted:<videoData.id>（66），按 id 对齐永远标不上「已下载」。
+check(
+  'panel.ts: 「已下载」按 slug 对齐（不能用 hit.id）',
+  /discCachedDir\(h\.slug\)/.test(panel) &&
+    /discState\.cached\[slug\]/.test(panel) &&
+    !/discState\.cached\['ted:' \+/.test(panel),
+  '又按 id 对齐了 —— 搜索结果与素材库的 id 不同源，标注会永久失效'
+);
+check(
+  'panel.ts: 下载完成回调按 slug 定位卡片',
+  /if \(msg\.slug\) discState\.cached\[msg\.slug\]/.test(panel),
+  'tedDownloaded 没按 slug 更新，下载完列表不会变成已下载'
+);
+check(
+  'panel.ts: 宿主的已下载清单带 slug',
+  /filter\(\(i\) => i\.hasAudio && i\.slug\)/.test(panel) && /function slugFromUrl/.test(panel),
+  '宿主没给 slug，页面无法与搜索结果对齐'
+);
+check(
+  'panel.ts: 布局选择会持久化（setState/getState）',
+  /vscode\.setState/.test(panel) && /vscode\.getState/.test(panel)
+);
 
 check('panel.ts: 含 <audio id="player">', /<audio id="player"/.test(panel));
 check('panel.ts: 含 url 输入框与 load 按钮', /id="url"/.test(panel) && /id="load"/.test(panel));
