@@ -182,6 +182,11 @@ export function activate(context: vscode.ExtensionContext): void {
       if (e.affectsConfiguration('listeningTrainer.materialsDir')) {
         handleMaterialsDirChange();
       }
+      // 影响页面渲染的配置：立即推给当前面板，不必重载窗口
+      // （用户改完设置想马上看到按钮出现/消失）
+      if (e.affectsConfiguration('listeningTrainer.showAudioDiagnostics')) {
+        PracticePanel.current?.pushConfig();
+      }
     })
   );
 

@@ -30,10 +30,14 @@ function check(name: string, ok: boolean, detail?: string): void {
 const panelPath = path.join(__dirname, '../../src/webview/panel.ts');
 const sidebarPath = path.join(__dirname, '../../src/webview/sidebar.ts');
 const timingPath = path.join(__dirname, '../../src/core/timing.ts');
+const extPath = path.join(__dirname, '../../src/extension.ts');
+const pkgPath = path.join(__dirname, '../../package.json');
 
 const panel = fs.readFileSync(panelPath, 'utf8');
 const sidebar = fs.readFileSync(sidebarPath, 'utf8');
 const timingSrc = fs.readFileSync(timingPath, 'utf8');
+const extSrc = fs.readFileSync(extPath, 'utf8');
+const pkg = fs.readFileSync(pkgPath, 'utf8');
 
 console.log('=== webview HTML 生成器自检 ===\n');
 
@@ -511,6 +515,48 @@ check(
 check('panel.ts: 含 <audio id="player">', /<audio id="player"/.test(panel));
 check('panel.ts: 含 url 输入框与 load 按钮', /id="url"/.test(panel) && /id="load"/.test(panel));
 check('panel.ts: 含 diagContent 诊断容器', /id="diagContent"/.test(panel));
+
+/* ---------- 音频诊断按钮：改为开发者开关（2026-09-19） ----------
+ * 音频链路打通后，🔧 不该再对普通用户暴露 —— 改由
+ * listeningTrainer.showAudioDiagnostics 控制（默认关）。
+ *
+ * 锁这几点，缺一个都会退化：
+ *   - 开关默认必须是 false（否则等于没隐藏）
+ *   - 按钮与诊断面板都要真的受开关控制，不能无条件渲染
+ *   - 绑定必须判空：开关关着时按钮不存在，getElementById 返回 null
+ *   - 改设置要即时生效（宿主在配置变更时推送），不必重载窗口
+ *   - 播放失败提示不能指向一个不存在的 🔧 按钮
+ */
+check(
+  'package.json: 有 listeningTrainer.showAudioDiagnostics（默认 false）',
+  /"listeningTrainer\.showAudioDiagnostics"/.test(pkg) &&
+    /"listeningTrainer\.showAudioDiagnostics"[\s\S]{0,220}?"default":\s*false/.test(pkg),
+  '缺少开发者开关，或默认值不是 false —— 普通用户仍会看到 🔧'
+);
+check(
+  'panel.ts: 🔧 按钮与诊断面板都受 showAudioDiag 控制',
+  /state\.showAudioDiag/.test(panel) &&
+    !/'<button id="diag" class="ghost" title="诊断音频加载">🔧<\/button>' \+/.test(panel),
+  '诊断按钮被无条件渲染了'
+);
+check(
+  'panel.ts: 诊断按钮的绑定判空（开关关着时按钮不存在）',
+  /const diagBtn = document\.getElementById\('diag'\)/.test(panel) &&
+    /if \(diagBtn\) \{/.test(panel),
+  '开关关闭时绑定会抛 TypeError（getElementById 返回 null）'
+);
+check(
+  'panel.ts + extension.ts: 开关经 config 消息下发（ready 时 + 配置变更时）',
+  /type: 'config'/.test(panel) &&
+    /case 'ready':[\s\S]{0,160}pushConfig\(\)/.test(panel) &&
+    /affectsConfiguration\('listeningTrainer\.showAudioDiagnostics'\)/.test(extSrc),
+  '改设置要重载窗口才生效'
+);
+check(
+  'panel.ts: 播放失败提示不指向不存在的 🔧 按钮',
+  /state\.showAudioDiag[\s\S]{0,240}请点 🔧/.test(panel),
+  '提示里硬提 🔧，开关关着时用户根本找不到该按钮'
+);
 check('panel.ts: 绑定了 load 按钮点击', /getElementById\('load'\)\.onclick/.test(panel));
 check('panel.ts: 绑定了 report 按钮点击', /getElementById\('report'\)\.onclick/.test(panel));
 check('panel.ts: 含 audio error 监听', /player\.addEventListener\('error'/.test(panel));

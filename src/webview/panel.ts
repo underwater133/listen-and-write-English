@@ -496,6 +496,7 @@ export class PracticePanel {
 
       case 'ready':
         trace('[LT-TRACE] webview ready，回推素材');
+        this.pushConfig();
         this.pushMaterial();
         break;
 
@@ -998,6 +999,24 @@ export class PracticePanel {
   }
 
   /**
+   * 把影响页面渲染的配置推给 webview（目前只有「是否显示音频诊断按钮」）。
+   *
+   * ⚠️ 为什么单开一条消息、不搭 material 的顺风车：
+   *    页面收到 'material' 会把 currentIndex 重置为 0 —— 用户改设置时
+   *    不该把他正在练的那一句踢回第一句。
+   *
+   * 调用点：webview 就绪（case 'ready'）+ 配置变更（extension.ts 监听）。
+   */
+  pushConfig(): void {
+    this.webview.postMessage({
+      type: 'config',
+      showAudioDiag: vscode.workspace
+        .getConfiguration('listeningTrainer')
+        .get<boolean>('showAudioDiagnostics', false),
+    });
+  }
+
+  /**
    * 校验并规整用户提交的句子时间轴。返回 null = 不合法，直接拒绝。
    *
    * 为什么必须校验而不是照单全收：越界的 start/end 会让 seek 落在不存在的
@@ -1469,6 +1488,10 @@ let state = {
   // 当前素材已手工修正的句数 —— 宿主在 material / timingPatched 里告知，
   // 决定「复原全部」要不要出现
   timingCount: 0,
+  // 是否显示音频加载诊断按钮（🔧）。
+  // 默认关：音频链路已打通，这是留给开发者的排查工具，
+  // 由 listeningTrainer.showAudioDiagnostics 控制（宿主在 ready / 配置变更时推）
+  showAudioDiag: false,
 };
 
 // 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
@@ -1523,6 +1546,11 @@ window.addEventListener('message', (e) => {
     render();
   }
   if (msg.type === 'timingError') showPlayerError(msg.message);
+  // 影响渲染的配置（宿主在 ready 与配置变更时推；这里的 render 不动 currentIndex）
+  if (msg.type === 'config') {
+    state.showAudioDiag = !!msg.showAudioDiag;
+    render();
+  }
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
   // ★ 下载来源区分（2026-09-19）：
   //   - 「发现 TED」列表里点「下载」→ 进度/错误只更新那张卡片，页面留在列表
@@ -2269,7 +2297,10 @@ function renderPractice() {
       '<button id="next" class="ghost">下一句</button>' +
       '<button id="rate" class="ghost">' + state.rate + 'x</button>' +
       '<button id="loop" class="ghost">' + (state.loop ? '循环开' : '循环关') + '</button>' +
-      '<button id="diag" class="ghost" title="诊断音频加载">🔧</button>' +
+      // 音频诊断是开发者工具：默认不渲染（listeningTrainer.showAudioDiagnostics）
+      (state.showAudioDiag
+        ? '<button id="diag" class="ghost" title="诊断音频加载">🔧</button>'
+        : '') +
       '<span class="pos">' + (i + 1) + ' / ' + m.sentences.length +
         ' · ' + fmtTime(s.startMs) + '–' + fmtTime(s.endMs) + '</span>' +
     '</div>' +
@@ -2277,14 +2308,17 @@ function renderPractice() {
     // 时间轴微调条（折叠态只占一行）
     timingHtml(s) +
 
-    '<div class="answer" id="diagBox" style="display:none">' +
-      '<div class="lbl">音频加载诊断</div>' +
-      '<div id="diagContent" class="hint" style="white-space:pre-wrap;font-size:11px"></div>' +
-      '<div class="player" style="margin-top:8px">' +
-        '<button id="diagBlob" class="ghost">用 Blob 重载</button>' +
-        '<button id="diagData" class="ghost">用 DataURI 重载</button>' +
-      '</div>' +
-    '</div>' +
+    // 诊断面板与按钮同开关：没有按钮就不该留一个永远打不开的盒子
+    (state.showAudioDiag
+      ? '<div class="answer" id="diagBox" style="display:none">' +
+          '<div class="lbl">音频加载诊断</div>' +
+          '<div id="diagContent" class="hint" style="white-space:pre-wrap;font-size:11px"></div>' +
+          '<div class="player" style="margin-top:8px">' +
+            '<button id="diagBlob" class="ghost">用 Blob 重载</button>' +
+            '<button id="diagData" class="ghost">用 DataURI 重载</button>' +
+          '</div>' +
+        '</div>'
+      : '') +
 
     '<textarea id="input" placeholder="听写这一句，按 Ctrl+Enter 检查…">' +
       esc(state.results[i] ? state.results[i].raw : '') + '</textarea>' +
@@ -2343,13 +2377,17 @@ function renderPractice() {
   };
   document.getElementById('check').onclick = doCheck;
 
-  document.getElementById('diag').onclick = () => {
-    const box = document.getElementById('diagBox');
-    box.style.display = box.style.display === 'none' ? 'block' : 'none';
-    if (box.style.display === 'block') runDiag();
-  };
-  document.getElementById('diagBlob').onclick = () => reloadAsBlob();
-  document.getElementById('diagData').onclick = () => reloadAsDataUri();
+  // 诊断按钮默认不存在（开发者开关关着），绑定必须判空
+  const diagBtn = document.getElementById('diag');
+  if (diagBtn) {
+    diagBtn.onclick = () => {
+      const box = document.getElementById('diagBox');
+      box.style.display = box.style.display === 'none' ? 'block' : 'none';
+      if (box.style.display === 'block') runDiag();
+    };
+    document.getElementById('diagBlob').onclick = () => reloadAsBlob();
+    document.getElementById('diagData').onclick = () => reloadAsDataUri();
+  }
 
   const ta = document.getElementById('input');
   ta.focus();
@@ -2646,8 +2684,11 @@ async function playCurrent() {
           '→ 这是旧版缓存，删除该素材后重新加载即可（v3 起改为 MP4 容器）。\\n'
         : '') +
       '直链: ' + m.audioUri + '\\n' +
-      '请点 🔧 查看诊断详情（含容器判定与播放器能力），' +
-      '并把扩展宿主输出里的 [LT-TRACE] 行发出来。'
+      // 诊断按钮默认是关的（开发者开关），提示不能指向一个不存在的按钮
+      (state.showAudioDiag
+        ? '请点 🔧 查看诊断详情（含容器判定与播放器能力），并把扩展宿主输出里的 [LT-TRACE] 行发出来。'
+        : '把扩展宿主输出里的 [LT-TRACE] 行发出来即可定位；需要更详细的现场信息时，' +
+          '可在设置里开启 listeningTrainer.showAudioDiagnostics，界面上会出现 🔧 诊断按钮。')
     );
     return;
   }

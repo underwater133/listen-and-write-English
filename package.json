@@ -86,6 +86,11 @@
           "type": "boolean",
           "default": true,
           "description": "裁掉 TED 片头（3.527s）。关闭后需用 VTT 原始时间轴。"
+        },
+        "listeningTrainer.showAudioDiagnostics": {
+          "type": "boolean",
+          "default": false,
+          "description": "在练习界面显示音频加载诊断按钮（🔧）。仅用于排查音频播放问题，日常使用无需开启。"
         }
       }
     }
