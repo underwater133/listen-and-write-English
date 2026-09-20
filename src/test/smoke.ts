@@ -27,7 +27,7 @@ const TALK_URL =
 
 async function main(): Promise<void> {
   const t0 = Date.now();
-  const cacheDir = path.join(os.tmpdir(), 'listening-trainer-smoke');
+  const cacheDir = path.join(os.tmpdir(), 'listen-and-write-smoke');
   fs.mkdirSync(cacheDir, { recursive: true });
 
   console.log('缓存目录:', cacheDir);

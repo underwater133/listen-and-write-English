@@ -42,7 +42,7 @@ node out/test/diagSeams.js         # 分片接缝诊断（前 6 片，约 3s）
 ```
 
 > ⚠️ 跑冒烟测试前**先清缓存**，否则会复用旧结果：
-> `rm -rf "$TMP/listening-trainer-smoke"`
+> `rm -rf "$TMP/listen-and-write-smoke"`
 >
 > 冒烟测试里的 ❌ **会影响退出码**（曾经出现过「输出 ❌ 但打印全部通过」的假信号）。
 >

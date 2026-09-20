@@ -1510,11 +1510,11 @@ player.addEventListener('error', () => {
   if (!isActive) {
     pageLog('[LT-PAGE] 忽略非当前源的 error（探测/换源中间态）：failedSrc =',
       failedSrc || '(空)', '| detail =', detail);
-    console.log('[listening-trainer] 过渡性 audio error（不弹提示）', detail, failedSrc);
+    console.log('[listen-and-write] 过渡性 audio error（不弹提示）', detail, failedSrc);
     return;
   }
   showPlayerError(detail);
-  console.error('[listening-trainer] audio error', err);
+  console.error('[listen-and-write] audio error', err);
 });
 
 let state = {
