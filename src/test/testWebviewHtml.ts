@@ -462,15 +462,47 @@ check(
   '列表没限制在容器内，长字幕会把整页撑出滚动条'
 );
 check(
-  'panel.ts: 上下布局的操作栏永不压缩（flex: 0 0 auto 且不设 max-height）',
-  /\.main\.stacked \.practice \{[^}]*flex: 0 0 auto/.test(panel) &&
+  'panel.ts: 上下布局操作栏按内容走、矮容器下可收缩滚动（不设 max-height）',
+  /\.main\.stacked \.practice \{[^}]*flex: 0 1 auto/.test(panel) &&
+    /\.main\.stacked \.practice \{[^}]*min-height: 0/.test(panel) &&
     !/\.main\.stacked \.practice \{[^}]*max-height/.test(panel),
-  '操作栏被压缩或加了 max-height —— 会出内部滚动条/裁行，等于隐藏了部分功能'
+  '操作栏空间不足时既不收缩也不滚动，内容会被裁掉且滚不到（2026-09-20 反馈）'
 );
 check(
-  'panel.ts: 上下布局收起列表后操作栏不伸展（下方留白）',
-  /\.main\.stacked\.collapsed \.practice \{ flex: 0 0 auto; \}/.test(panel),
-  '收起后操作栏伸展了，与「保持原高度」的约定不符'
+  'panel.ts: 上下布局收起列表后操作栏同样可收缩滚动',
+  /\.main\.stacked\.collapsed \.practice \{ flex: 0 1 auto; min-height: 0; \}/.test(panel),
+  '收起后操作栏在矮容器下无法收缩，内容会被裁掉且滚不到'
+);
+check(
+  'panel.ts: 练习区内部滚动且滚动条隐藏（滚轮可滚，不显示滚动条）',
+  /\.practice \{[^}]*min-height: 0/.test(panel) &&
+    /\.practice \{[^}]*overflow-y: auto/.test(panel) &&
+    /\.practice \{[^}]*scrollbar-width: none/.test(panel) &&
+    /\.practice::-webkit-scrollbar \{ display: none; \}/.test(panel),
+  '练习区缺 min-height:0 会被裁掉且滚不动；滚动条未隐藏则不符合需求'
+);
+
+// ★ 分隔条拖拽（2026-09-20）：窄条既能拖也能点，比例要夹紧并持久化
+check(
+  'panel.ts: list-toggle 是拖拽手柄（col-resize / row-resize 光标）',
+  /\.list-toggle \{[^}]*cursor: col-resize/.test(panel) &&
+    /\.main\.stacked \.list-toggle \{[^}]*cursor: row-resize/.test(panel),
+  '分隔条没有 resize 光标，用户发现不了可以拖'
+);
+check(
+  'panel.ts: 拖拽比例夹紧在 0.2~0.8，双击可恢复默认',
+  /function bindListResize/.test(panel) &&
+    /Math\.min\(0\.8, Math\.max\(0\.2, /.test(panel) &&
+    /state\.listRatio = null/.test(panel) &&
+    /state\.stackedRatio = null/.test(panel),
+  '拖拽占比没有夹紧，或没有恢复默认的入口'
+);
+check(
+  'panel.ts: 拖拽出的占比会持久化',
+  /listRatio: state\.listRatio/.test(panel) &&
+    /stackedRatio: state\.stackedRatio/.test(panel) &&
+    /typeof saved\.listRatio === 'number'/.test(panel),
+  '拖拽占比没存进 setState/getState，重开面板就丢'
 );
 
 // ★ 回归防线：「已下载」必须按 slug 对齐。

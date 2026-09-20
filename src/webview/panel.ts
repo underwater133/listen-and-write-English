@@ -1207,8 +1207,18 @@ export class PracticePanel {
   .item .idx { color: var(--muted); font-size: 11px; min-width: 26px; }
   .item .txt { flex: 1; line-height: 1.4; }
 
-  /* 右：练习区 */
-  .practice { flex: 1 1 55%; display: flex; flex-direction: column; padding: 12px; gap: 10px; overflow-y: auto; }
+  /* 右：练习区。
+     min-height: 0 必须有：flex 子项默认 min-height:auto，会被内容撑到超过
+     #root，然后被 overflow:hidden 裁掉 —— 表现就是「下面看不见也滚不动」
+     （2026-09-20 反馈）。收缩后靠 overflow-y:auto 内部滚动。
+     滚动条按需求隐藏（2026-09-20）：滚轮/触摸仍可滚，只是不显示滚动条。 */
+  .practice {
+    flex: 1 1 55%; display: flex; flex-direction: column;
+    padding: 12px; gap: 10px;
+    min-height: 0; overflow-y: auto;
+    scrollbar-width: none;
+  }
+  .practice::-webkit-scrollbar { display: none; }
   .player { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .player .pos { color: var(--muted); font-size: 12px; margin-left: auto; }
   .answer {
@@ -1273,7 +1283,8 @@ export class PracticePanel {
   .list-toggle {
     flex: 0 0 auto; width: 18px;
     display: flex; align-items: center; justify-content: center;
-    cursor: pointer; color: var(--muted);
+    /* col-resize：这条窄条同时是拖拽手柄（拖动调列表宽度） */
+    cursor: col-resize; color: var(--muted);
     border-right: 1px solid var(--border);
     user-select: none; font-size: 12px;
   }
@@ -1284,22 +1295,23 @@ export class PracticePanel {
    *   操作区(1) → 开关条(2) → 字幕列表(3)
    * 也就是：操作栏 → 紧贴它下方的开关条 → 字幕列表。
    *
-   * 高度分配是这里最容易踩的坑（2026-09-19 用户明确要求）：
-   *   - 操作区 flex: 0 0 auto —— **永不压缩**：高度完全按内容走，
-   *     不出内部滚动条、不裁行。窗口很矮时宁可把列表压小，
-   *     也不能隐藏操作栏的功能。
+   * 高度分配是这里最容易踩的坑（2026-09-19 用户要求 + 2026-09-20 修订）：
+   *   - 操作区 flex: 0 1 auto + min-height: 0 —— 高度按内容走，**空间够时
+   *     永不伸展、不裁行**；但容器很矮时允许收缩并内部滚动（滚动条隐藏），
+   *     否则内容直接被 overflow:hidden 裁掉且滚不到 —— 比「压缩」更糟。
    *   - 列表 flex: 1 1 auto + min-height: 0 —— 吃掉剩余空间并【内部滚动】；
    *     再配合 .main.stacked 的 overflow:hidden，字幕再长也不会撑破容器
    *     （整页不出现滚动条，列表自己有右侧滚动条）。
-   *   - 收起时列表不占位，但操作区**保持原高度**（下方留白，不伸展）。
+   *   - 收起时列表不占位，操作区同样按内容走、必要时收缩滚动。
    */
   .main.stacked { flex-direction: column; overflow: hidden; }
   .main.stacked .practice {
-    order: 1; flex: 0 0 auto;
+    order: 1; flex: 0 1 auto; min-height: 0;
     border-bottom: 1px solid var(--border);
   }
   .main.stacked .list-toggle {
     order: 2; width: auto; height: 14px; border-right: none;
+    cursor: row-resize;
   }
   .main.stacked .list {
     order: 3; flex: 1 1 auto; min-height: 0;
@@ -1309,7 +1321,7 @@ export class PracticePanel {
     border-right: none;
   }
   .main.stacked.collapsed .list { display: none; }
-  .main.stacked.collapsed .practice { flex: 0 0 auto; }
+  .main.stacked.collapsed .practice { flex: 0 1 auto; min-height: 0; }
 
   /* ---- 「发现 TED」视图 ---- */
   .discover { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
@@ -1529,6 +1541,10 @@ let state = {
   // 播放模式：off = 播完当前句停；loop = 当前句循环重播；auto = 连播（自动下一句，纯听）
   playMode: 'off',
   listCollapsed: false,
+  // 字幕列表占比（用户拖过分隔条后的自定义值；null = 用 CSS 默认 45%）。
+  // listRatio = 左右布局的宽度占比；stackedRatio = 上下布局的高度占比
+  listRatio: null,
+  stackedRatio: null,
   // 布局：false = 左字幕 / 右操作（默认）；true = 上操作 / 下字幕
   stacked: false,
   // 时间轴微调面板是否展开（只在会话内记忆，不持久化）
@@ -1549,12 +1565,20 @@ try {
   if (typeof vscode.getState === 'function') {
     const saved = vscode.getState();
     if (saved && typeof saved.stacked === 'boolean') state.stacked = saved.stacked;
+    if (saved && typeof saved.listRatio === 'number') state.listRatio = saved.listRatio;
+    if (saved && typeof saved.stackedRatio === 'number') state.stackedRatio = saved.stackedRatio;
   }
 } catch (e) { /* 取不到就用默认布局 */ }
 
 function saveLayout() {
   try {
-    if (typeof vscode.setState === 'function') vscode.setState({ stacked: state.stacked });
+    if (typeof vscode.setState === 'function') {
+      vscode.setState({
+        stacked: state.stacked,
+        listRatio: state.listRatio,
+        stackedRatio: state.stackedRatio,
+      });
+    }
   } catch (e) { /* 存不了不影响使用 */ }
 }
 
@@ -2136,6 +2160,82 @@ function fmtTime(ms) {
 
 /* ---------------- 渲染 ---------------- */
 
+/** 把当前占比应用到 .list（null = 交给 CSS 默认）。收起状态下不干预。 */
+function applyListFlex() {
+  const listEl = document.getElementById('list');
+  if (!listEl) return;
+  const r = state.stacked ? state.stackedRatio : state.listRatio;
+  if (typeof r === 'number' && !state.listCollapsed) {
+    listEl.style.flex = '0 0 ' + (Math.round(r * 1000) / 10) + '%';
+  } else {
+    listEl.style.flex = '';
+  }
+}
+
+/* ---- 分隔条：拖动调列表占比，单击收起/展开，双击恢复默认 ----
+ * 复用 .list-toggle 这条窄条当手柄，不额外占空间。
+ * 「点击 vs 拖动」用位移阈值区分：按下后挪动 < 4px 算点击。
+ * 拖动过程只改内联样式不重绘（render() 会重建 DOM，拖动中重绘会闪）。
+ * 双击会先触发两次 click（收起又展开，净效果不变），再触发重置。 */
+function bindListResize(handle) {
+  if (!handle) return;
+  const mainEl = handle.parentElement;
+  let dragging = false, moved = false, startPos = 0;
+  const clampRatio = (v) => Math.min(0.8, Math.max(0.2, v));
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const rect = mainEl.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const now = state.stacked ? e.clientY : e.clientX;
+    if (Math.abs(now - startPos) >= 4) moved = true;
+    if (!moved) return;
+    let r;
+    if (state.stacked) {
+      // 上下布局：手柄在列表上方，鼠标上移 → 列表变高
+      r = (rect.bottom - e.clientY) / rect.height;
+    } else {
+      // 左右布局：列表在左，鼠标右移 → 列表变宽
+      r = (e.clientX - rect.left) / rect.width;
+    }
+    if (state.stacked) state.stackedRatio = clampRatio(r);
+    else state.listRatio = clampRatio(r);
+    applyListFlex();
+  };
+
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    document.body.style.userSelect = '';
+    if (moved) saveLayout();
+  };
+
+  handle.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    dragging = true; moved = false;
+    startPos = state.stacked ? e.clientY : e.clientX;
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  handle.addEventListener('click', () => {
+    if (moved) { moved = false; return; } // 拖动结束附带的 click，不算点击
+    state.listCollapsed = !state.listCollapsed;
+    render();
+  });
+
+  handle.addEventListener('dblclick', () => {
+    state.listRatio = null;
+    state.stackedRatio = null;
+    saveLayout();
+    render();
+  });
+}
+
 function render() {
   const m = state.material;
   if (!m) return;
@@ -2154,7 +2254,7 @@ function render() {
     '<div class="main' + (state.listCollapsed ? ' collapsed' : '') +
       (state.stacked ? ' stacked' : '') + '">' +
       '<div class="list-toggle" id="listToggle" title="' +
-        (state.listCollapsed ? '展开字幕列表' : '收起字幕列表') + '">' +
+        '拖动调整列表大小 · 单击收起/展开 · 双击恢复默认' + '">' +
         toggleArrow + '</div>' +
       '<div class="list" id="list"></div>' +
       '<div class="practice" id="practice"></div>' +
@@ -2163,13 +2263,12 @@ function render() {
   renderList();
   renderPractice();
 
-  // 字幕列表收缩开关：侧边栏/窄编辑器里收起后听写区独占整行
-  document.getElementById('listToggle').onclick = () => {
-    state.listCollapsed = !state.listCollapsed;
-    render();
-  };
+  // 字幕列表收缩开关 + 分隔条拖拽：单击收起（侧边栏/窄编辑器里听写区独占整行），
+  // 按住拖动调整占比，双击恢复默认
+  bindListResize(document.getElementById('listToggle'));
 
   updateLayoutBtn();
+  applyListFlex();
 }
 
 function renderList() {
