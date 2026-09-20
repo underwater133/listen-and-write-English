@@ -1529,6 +1529,15 @@ player.addEventListener('error', () => {
   console.error('[listen-and-write] audio error', err);
 });
 
+/* 播放按钮文案由事件驱动同步：play/pause 事件在 seek 后自动播、看门狗
+   句尾暂停、用户点暂停/恢复时都会触发，不用各处手动改按钮文字 */
+function updatePlayBtn() {
+  const btn = document.getElementById('play');
+  if (btn) btn.textContent = player.paused ? '▶ 播放' : '⏸ 暂停';
+}
+player.addEventListener('play', updatePlayBtn);
+player.addEventListener('pause', updatePlayBtn);
+
 // 三态播放按钮（点击循环切换：off → loop → auto → off）
 const PLAY_MODE_ORDER = ['off', 'loop', 'auto'];
 const PLAY_MODE_LABEL = { off: '循环关', loop: '循环开', auto: '连播' };
@@ -2260,15 +2269,21 @@ function render() {
       '<div class="practice" id="practice"></div>' +
     '</div>';
 
-  renderList();
+  // ★ 顺序有讲究（2026-09-20 二次修复）：必须先填操作区、再定列表占比、
+  //   最后填列表并定位当前句。stacked 布局下 .practice 是 flex:0 1 auto
+  //   按内容占高、.list 吃剩余空间 —— 若先 renderList，此刻 .practice 还是
+  //   空的、.list 高度虚高，居中算出的 scrollTop 在 practice 填充后就会
+  //   把当前句挤到视口底部甚至视口外（用户反馈「列表只显示 4 句时当前句
+  //   永远在底部，再缩高度就完全看不见」就是这个原因）。
   renderPractice();
+  applyListFlex();
+  renderList();
 
   // 字幕列表收缩开关 + 分隔条拖拽：单击收起（侧边栏/窄编辑器里听写区独占整行），
   // 按住拖动调整占比，双击恢复默认
   bindListResize(document.getElementById('listToggle'));
 
   updateLayoutBtn();
-  applyListFlex();
 }
 
 function renderList() {
@@ -2297,8 +2312,18 @@ function renderList() {
     };
   });
 
+  // 定位当前播放句：⚠️ 不能用 scrollIntoView —— 它会滚动【所有】可滚动祖先，
+  // 包括 overflow:hidden 的 html/body/#root（hidden 容器仍可被程序化滚动），
+  // 结果整页内容被顶出可视区，表现为「位置跳转、当前句差好几条看不见」
+  // （2026-09-20 反馈）。这里手动只滚 .list 自身，居中偏好。
   const active = list.querySelector('.item.active');
-  if (active) active.scrollIntoView({ block: 'nearest' });
+  if (active && list.clientHeight > 0) {
+    const listRect = list.getBoundingClientRect();
+    const itemRect = active.getBoundingClientRect();
+    const target = list.scrollTop + (itemRect.top - listRect.top) -
+      (list.clientHeight - itemRect.height) / 2;
+    list.scrollTop = Math.max(0, target);
+  }
 }
 
 /* ---------------- 逐句时间轴微调 ----------------
@@ -2415,6 +2440,17 @@ function renderPractice() {
   const s = m.sentences[i];
   if (!s) return;
 
+  // 连播切句会整体重建 DOM —— 先记住输入框当前有没有焦点、光标在哪，
+  // 重建后原样恢复。不恢复的话，即使「连播不抢焦点」，用户自己点进
+  // 输入框的焦点也会在每次切句时被悄悄丢掉（2026-09-20 反馈：不应该
+  // 去操作它，原本什么样就保持什么样）。
+  const prevInput = document.getElementById('input');
+  const hadInputFocus = document.activeElement &&
+    document.activeElement.id === 'input';
+  const prevValue = prevInput ? prevInput.value : null;
+  const prevSel = (hadInputFocus && prevInput)
+    ? [prevInput.selectionStart, prevInput.selectionEnd] : null;
+
   const r = state.results[i];
   const p = document.getElementById('practice');
 
@@ -2441,7 +2477,11 @@ function renderPractice() {
 
   p.innerHTML =
     '<div class="player">' +
-      '<button id="play">▶ 播放</button>' +
+      // 初始文案必须按播放器实际状态渲染：render() 重建 DOM 会把按钮文案
+      // 重置，而「正在播放中切句/跳句」时 play() 在未暂停状态下不会再次
+      // 触发 play 事件，按钮就会停留在错误的「▶ 播放」
+      // （2026-09-20 反馈：切句后播放按钮状态错乱）
+      '<button id="play">' + (player.paused ? '▶ 播放' : '⏸ 暂停') + '</button>' +
       '<button id="prev" class="ghost">上一句</button>' +
       '<button id="next" class="ghost">下一句</button>' +
       '<button id="rate" class="ghost">' + state.rate + 'x</button>' +
@@ -2505,7 +2545,19 @@ function renderPractice() {
     tResetAllBtn.onclick = () => vscode.postMessage({ type: 'resetAllTiming' });
   }
 
-  document.getElementById('play').onclick = playCurrent;
+  // 播放按钮二态（连播/循环模式下也能随时暂停）：
+  // 播放中 → 暂停；暂停且播放位置仍在当前句区间内 → 原地恢复（不重新 seek）；
+  // 否则（停着/已播到句尾）→ 从句首播
+  document.getElementById('play').onclick = () => {
+    if (!player.paused) { player.pause(); return; }
+    const s = m && m.sentences[i];
+    const ms = player.currentTime * 1000;
+    if (player.currentSrc && s && ms > s.startMs && ms < s.endMs) {
+      player.play().catch(() => {});
+    } else {
+      playCurrent();
+    }
+  };
   document.getElementById('replay').onclick = playCurrent;
   document.getElementById('prev').onclick = () => { if (i > 0) { state.currentIndex = i - 1; render(); playCurrent(); } };
   document.getElementById('next').onclick = () => { if (i < m.sentences.length - 1) { state.currentIndex = i + 1; render(); playCurrent(); } };
@@ -2544,8 +2596,13 @@ function renderPractice() {
   }
 
   const ta = document.getElementById('input');
-  // 连播是「纯听」模式：不抢焦点，键盘事件留给全局
-  if (state.playMode !== 'auto') ta.focus();
+  // 非连播模式（听写）主动聚焦输入框；连播模式不抢焦点，
+  // 但重建前输入框已有焦点（用户自己点进去的）则原样恢复
+  if (hadInputFocus || state.playMode !== 'auto') ta.focus();
+  // 内容没变（同句重渲染）才恢复光标位置；切句后是新内容，恢复旧偏移无意义
+  if (prevSel && prevValue !== null && ta.value === prevValue) {
+    ta.setSelectionRange(prevSel[0], prevSel[1]);
+  }
   ta.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doCheck(); }
   });

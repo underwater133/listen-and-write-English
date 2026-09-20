@@ -505,6 +505,39 @@ check(
   '拖拽占比没存进 setState/getState，重开面板就丢'
 );
 
+// ★ 当前句定位（2026-09-20）：scrollIntoView 会连带滚动 overflow:hidden 的
+//   祖先（html/body/#root），整页被顶出可视区 —— 必须手动只滚 .list
+check(
+  'panel.ts: 当前句定位禁用 scrollIntoView（只手动滚 .list 自身）',
+  !/scrollIntoView/.test(panel.replace(/\/\/[^\n]*/g, '')) && // 注释里提到名字不算使用
+    /list\.scrollTop = Math\.max\(0, /.test(panel),
+  '用了 scrollIntoView 会把 overflow:hidden 的祖先一起滚走，整页错位'
+);
+// ★ 播放按钮二态（2026-09-20）：连播模式下要有暂停/恢复
+check(
+  'panel.ts: 播放按钮二态（暂停 + 句内原地恢复）',
+  /updatePlayBtn/.test(panel) &&
+    /player\.addEventListener\('play', updatePlayBtn\)/.test(panel) &&
+    /player\.addEventListener\('pause', updatePlayBtn\)/.test(panel) &&
+    /if \(!player\.paused\) \{ player\.pause\(\); return; \}/.test(panel) &&
+    /ms > s\.startMs && ms < s\.endMs/.test(panel) &&
+    // 重建 DOM 时按实际状态渲染初始文案（播放中切句不会再触发 play 事件）
+    /'<button id="play">' \+ \(player\.paused \? '▶ 播放' : '⏸ 暂停'\)/.test(panel),
+  '播放按钮没有暂停/恢复逻辑，连播模式下只能改播放逻辑才能停下来'
+);
+check(
+  'panel.ts: render 顺序为 renderPractice → applyListFlex → renderList（列表定位依赖最终高度）',
+  /renderPractice\(\);\s*\n\s*applyListFlex\(\);\s*\n\s*renderList\(\);/.test(panel),
+  '顺序错了会让当前句定位算在虚高的列表高度上（practice 未填充），当前句被挤到视口外'
+);
+check(
+  'panel.ts: 连播切句不丢输入框焦点（重建前记住，重建后原样恢复）',
+  /hadInputFocus/.test(panel) &&
+    /if \(hadInputFocus \|\| state\.playMode !== 'auto'\) ta\.focus\(\);/.test(panel) &&
+    /setSelectionRange\(prevSel\[0\], prevSel\[1\]\)/.test(panel),
+  '连播切句会整体重建 DOM，不恢复焦点的话用户点进输入框的焦点每句都会丢'
+);
+
 // ★ 回归防线：「已下载」必须按 slug 对齐。
 // 真实事故（2026-09-19）：搜索结果 hit.id 是 Algolia objectID（3292），
 // 素材库 id 是 ted:<videoData.id>（66），按 id 对齐永远标不上「已下载」。
