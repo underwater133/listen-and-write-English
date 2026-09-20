@@ -1550,6 +1550,10 @@ let state = {
   // 播放模式：off = 播完当前句停；loop = 当前句循环重播；auto = 连播（自动下一句，纯听）
   playMode: 'off',
   listCollapsed: false,
+  // 「看答案」面板是否展开（会话内记忆）：切句/倍速/切播放模式都不重置，
+  // 只有点「看答案」按钮本身才切换 —— 显隐由状态驱动，不挂在会被 render()
+  // 重建重置的 DOM style 上
+  revealAnswer: false,
   // 字幕列表占比（用户拖过分隔条后的自定义值；null = 用 CSS 默认 45%）。
   // listRatio = 左右布局的宽度占比；stackedRatio = 上下布局的高度占比
   listRatio: null,
@@ -2517,7 +2521,8 @@ function renderPractice() {
       '<button id="replay" class="ghost">⟲ 重播</button>' +
     '</div>' +
 
-    '<div class="answer" id="answerBox" style="display:none">' +
+    '<div class="answer" id="answerBox" style="display:' +
+      (state.revealAnswer ? 'block' : 'none') + '">' +
       '<div class="lbl">标准答案</div>' + esc(s.text) +
       (s.translation ? '<div class="lbl" style="margin-top:8px">译文</div>' + esc(s.translation) : '') +
     '</div>' +
@@ -2577,9 +2582,10 @@ function renderPractice() {
       if (s) armStopTimer(s.startMs / 1000, s.endMs / 1000);
     }
   };
+  // 看答案：显隐走 state（切句/倍速/切模式后依然保持），内容跟随当前句
   document.getElementById('reveal').onclick = () => {
-    const b = document.getElementById('answerBox');
-    b.style.display = b.style.display === 'none' ? 'block' : 'none';
+    state.revealAnswer = !state.revealAnswer;
+    render();
   };
   document.getElementById('check').onclick = doCheck;
 

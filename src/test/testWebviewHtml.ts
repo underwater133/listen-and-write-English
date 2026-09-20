@@ -537,6 +537,13 @@ check(
     /setSelectionRange\(prevSel\[0\], prevSel\[1\]\)/.test(panel),
   '连播切句会整体重建 DOM，不恢复焦点的话用户点进输入框的焦点每句都会丢'
 );
+check(
+  'panel.ts: 看答案面板显隐由 state.revealAnswer 驱动（切句/倍速/切模式不重置）',
+  /revealAnswer: false/.test(panel) &&
+    /id="answerBox" style="display:' \+/.test(panel) &&
+    /state\.revealAnswer = !state\.revealAnswer/.test(panel),
+  '答案面板显隐挂在会被 render() 重置的 DOM style 上，切句就消失'
+);
 
 // ★ 回归防线：「已下载」必须按 slug 对齐。
 // 真实事故（2026-09-19）：搜索结果 hit.id 是 Algolia objectID（3292），
