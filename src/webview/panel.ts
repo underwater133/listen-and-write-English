@@ -1517,12 +1517,17 @@ player.addEventListener('error', () => {
   console.error('[listen-and-write] audio error', err);
 });
 
+// 三态播放按钮（点击循环切换：off → loop → auto → off）
+const PLAY_MODE_ORDER = ['off', 'loop', 'auto'];
+const PLAY_MODE_LABEL = { off: '循环关', loop: '循环开', auto: '连播' };
+
 let state = {
   material: null,
   currentIndex: 0,
   results: {},
   rate: 1,
-  loop: false,
+  // 播放模式：off = 播完当前句停；loop = 当前句循环重播；auto = 连播（自动下一句，纯听）
+  playMode: 'off',
   listCollapsed: false,
   // 布局：false = 左字幕 / 右操作（默认）；true = 上操作 / 下字幕
   stacked: false,
@@ -2341,7 +2346,7 @@ function renderPractice() {
       '<button id="prev" class="ghost">上一句</button>' +
       '<button id="next" class="ghost">下一句</button>' +
       '<button id="rate" class="ghost">' + state.rate + 'x</button>' +
-      '<button id="loop" class="ghost">' + (state.loop ? '循环开' : '循环关') + '</button>' +
+      '<button id="loop" class="ghost">' + PLAY_MODE_LABEL[state.playMode] + '</button>' +
       // 音频诊断是开发者工具：默认不渲染（listeningTrainer.showAudioDiagnostics）
       (state.showAudioDiag
         ? '<button id="diag" class="ghost" title="诊断音频加载">🔧</button>'
@@ -2412,9 +2417,14 @@ function renderPractice() {
     render();
   };
   document.getElementById('loop').onclick = () => {
-    state.loop = !state.loop;
-    player.loop = state.loop;
+    state.playMode =
+      PLAY_MODE_ORDER[(PLAY_MODE_ORDER.indexOf(state.playMode) + 1) % PLAY_MODE_ORDER.length];
     render();
+    // 模式切换立即生效：正在播的句子按新模式重新布防看门狗
+    if (!player.paused) {
+      const s = state.material && state.material.sentences[state.currentIndex];
+      if (s) armStopTimer(s.startMs / 1000, s.endMs / 1000);
+    }
   };
   document.getElementById('reveal').onclick = () => {
     const b = document.getElementById('answerBox');
@@ -2435,13 +2445,15 @@ function renderPractice() {
   }
 
   const ta = document.getElementById('input');
-  ta.focus();
+  // 连播是「纯听」模式：不抢焦点，键盘事件留给全局
+  if (state.playMode !== 'auto') ta.focus();
   ta.addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); doCheck(); }
   });
 
   player.playbackRate = state.rate;
-  player.loop = state.loop;
+  // 原生循环是「整个文件」循环，与句级播放模型冲突，恒为关闭
+  player.loop = false;
 }
 
 function doCheck() {
@@ -2822,13 +2834,34 @@ async function playCurrent() {
     player.addEventListener('canplay', seekAndPlay, { once: true });
   }
 
-  // 自动停在句尾
+  armStopTimer(start, end);
+}
+
+/**
+ * 句尾看门狗：轮询到 currentTime 越过句尾时暂停，并按播放模式分派：
+ * - loop：回到句首重播，并重新布防（否则重播那遍没有看门狗，会失控播穿到后面句子）
+ * - auto：自动进入下一句继续播（纯听模式）；末句停下
+ * - off：只暂停
+ */
+function armStopTimer(start, end) {
   if (player._stopTimer) clearInterval(player._stopTimer);
   player._stopTimer = setInterval(() => {
-    if (!player.paused && player.currentTime >= end) {
-      player.pause();
-      if (state.loop) { player.currentTime = start; player.play().catch(() => {}); }
-      clearInterval(player._stopTimer);
+    if (player.paused || player.currentTime < end) return;
+    player.pause();
+    clearInterval(player._stopTimer);
+    const m = state.material;
+    if (state.playMode === 'loop') {
+      player.currentTime = start;
+      player.play().catch(() => {});
+      armStopTimer(start, end);
+    } else if (state.playMode === 'auto' && m) {
+      if (state.currentIndex < m.sentences.length - 1) {
+        state.currentIndex += 1;
+        render();
+        playCurrent();
+      } else {
+        pageLog('[LT-PAGE] 连播到末句，停止');
+      }
     }
   }, 50);
 }
