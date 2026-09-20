@@ -19,3 +19,6 @@ Thumbs.db
 *.mp3
 *.aac
 *.m4a
+
+# 扩展打包产物
+*.vsix

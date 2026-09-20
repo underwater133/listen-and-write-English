@@ -4,11 +4,26 @@
   "description": "Listen & Write · 听写英语 —— 逐句听写 + 词级 diff 诊断，把「听不懂」变成可追踪的数据",
   "version": "0.0.1",
   "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/underwater133/listen-and-write-English.git"
+  },
+  "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Education", "Other"],
-  "keywords": ["english", "listening", "dictation", "english learning", "听力", "精听"],
+  "categories": [
+    "Education",
+    "Other"
+  ],
+  "keywords": [
+    "english",
+    "listening",
+    "dictation",
+    "english learning",
+    "听力",
+    "精听"
+  ],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -68,7 +83,11 @@
         },
         "listeningTrainer.audioQuality": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
           "default": "medium",
           "description": "音频质量。medium 约 138kbps / 8MB 每 8 分钟。"
         },
@@ -98,12 +117,13 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "node ./out/test/runTests.js"
+    "test": "node ./out/test/runTests.js",
+    "release": "tsc -p ./ && vsce package"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.2",
     "typescript": "^5.4.0"
-  },
-  "dependencies": {}
+  }
 }
