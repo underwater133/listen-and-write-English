@@ -1336,10 +1336,12 @@ export class PracticePanel {
     border: 1px solid var(--input-border); border-radius: 3px; outline: none;
     font-family: inherit; font-size: inherit;
   }
+  /* 全局按钮：比默认小一号（导航/播放/检查等所有页面共用）；
+     答案面板里的收藏按钮（.fav-bar button，11px）比这还要再小一号 */
   button {
-    padding: 5px 12px; background: var(--accent); color: var(--accent-fg);
+    padding: 3px 10px; background: var(--accent); color: var(--accent-fg);
     border: none; border-radius: 3px; cursor: pointer;
-    font-family: inherit; font-size: inherit; white-space: nowrap;
+    font-family: inherit; font-size: 12px; white-space: nowrap;
   }
   button:hover { opacity: .9; }
   button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
@@ -1416,7 +1418,7 @@ export class PracticePanel {
   .tok:hover { background: rgba(128,128,128,.18); }
   .tok.sel { background: var(--accent); color: #fff; }
   .fav-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
-  /* 收藏按钮是答案面板内的轻量操作，比全局按钮小一号 */
+  /* 收藏按钮是答案面板内的轻量操作，比全局按钮（12px）再小一号 */
   .fav-bar button { padding: 2px 8px; font-size: 11px; flex: 0 0 auto; }
   .fav-bar .sel-text { color: var(--accent); font-size: 12px; }
   /* 收藏视图里的义项小标签（一个词的多个释义拆开展示） */
