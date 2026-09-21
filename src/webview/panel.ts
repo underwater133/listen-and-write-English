@@ -23,6 +23,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ListeningMaterial, MaterialSourceAdapter, AudioInfo, AudioProgress, relocateAudioPath, clampSentencesToAudio, extractNextDataJson, TedNextData, AUDIO_CACHE_VERSION } from '../core/types';
 import { httpGetText } from '../core/http';
+import { FavoriteEntry, FavoriteStore, TranslationQueue, baiduTranslate, baiduTranslateBatch } from '../core/favorites';
 import { checkSentence, SentenceResult, buildReport } from '../core/diff';
 import {
   applyTimingOverrides,
@@ -153,6 +154,14 @@ export class PracticePanel {
   private readonly ctx: vscode.ExtensionContext;
   private readonly deps: PanelDeps;
   private readonly store: MistakeStore;
+  /** 收藏（单词/短语/整句）：用户数据，存 globalStorage/favorites.json */
+  private readonly favs: FavoriteStore;
+  /** 百度翻译串行队列（标准版 QPS=1，队列内强制间隔） */
+  private readonly tQueue = new TranslationQueue();
+  /** 手动「更新翻译」批次剩余条数（>0 时 webview 显示进行中） */
+  private favRemaining = 0;
+  /** 从收藏视图跳回练习时要定位的句号（pushMaterial 消费后重置为 -1） */
+  private pendingJumpTo = -1;
   private material: ListeningMaterial | undefined;
   private audioUri: string | undefined;
   private disposables: vscode.Disposable[] = [];
@@ -244,6 +253,7 @@ export class PracticePanel {
     this.ctx = ctx;
     this.deps = deps;
     this.store = new MistakeStore(deps.storage);
+    this.favs = new FavoriteStore(deps.storage);
 
     this.webview.html = this.renderHtml();
 
@@ -281,6 +291,54 @@ export class PracticePanel {
     const records = this.store.readAll();
     const report = buildReport(records);
     this.webview.postMessage({ type: 'report', report });
+  }
+
+  /** 百度翻译 API 是否已配置（appId 与密钥都非空） */
+  private isBaiduConfigured(): boolean {
+    const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+    return !!cfg.get<string>('baiduAppId', '').trim() && !!cfg.get<string>('baiduSecret', '').trim();
+  }
+
+  /** 把收藏列表（+配置状态+批次进度）推给页面 */
+  private pushFavorites(updating?: boolean): void {
+    this.webview.postMessage({
+      type: 'favList',
+      favorites: this.favs.list(),
+      baiduConfigured: this.isBaiduConfigured(),
+      updating: !!updating,
+    });
+  }
+
+  /**
+   * 把一条收藏排进百度翻译队列（单词/短语用）。
+   * 队列串行 + 强制间隔，天然满足 QPS=1；失败保持 pending，
+   * 用户在收藏视图点「更新翻译」可再次重试。
+   */
+  private enqueueFavTranslation(fav: FavoriteEntry, batch: boolean): void {
+    this.tQueue.push(async () => {
+      try {
+        const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+        const appId = cfg.get<string>('baiduAppId', '').trim();
+        const secret = cfg.get<string>('baiduSecret', '').trim();
+        if (!appId || !secret) return;
+        const t = await baiduTranslate(
+          fav.text,
+          appId,
+          secret,
+          cfg.get<string>('proxy', '') || undefined
+        );
+        this.favs.setTranslation(fav.id, t);
+        trace('[LT-TRACE] 收藏译文就绪: ' + fav.text + ' → ' + t);
+      } catch (e: any) {
+        // 保持 pending，收藏视图里显示 ⏳，可再次手动重试
+        trace('[LT-TRACE] 收藏翻译失败 ' + fav.text + ': ' + String(e?.message ?? e));
+      } finally {
+        if (batch) {
+          this.favRemaining = Math.max(0, this.favRemaining - 1);
+          this.pushFavorites(this.favRemaining > 0);
+        }
+      }
+    }).catch(() => { /* 队列链已吞异常，这里兜底 */ });
   }
 
   /**
@@ -499,6 +557,102 @@ export class PracticePanel {
         this.pushConfig();
         this.pushMaterial();
         break;
+
+      /* ---------------- 收藏（单词/短语/整句） ---------------- */
+
+      case 'favAdd': {
+        const fav = msg.fav ?? {};
+        const type = String(fav.type ?? '');
+        const text = String(fav.text ?? '').trim();
+        if (!text || (type !== 'word' && type !== 'phrase' && type !== 'sentence')) break;
+        const ctx = fav.context ?? {};
+        const idx = Number(ctx.sentenceIndex);
+        // 整句译文以宿主素材为权威（webview 传来的只作兜底）
+        let sentenceTranslation = String(ctx.sentenceTranslation ?? '');
+        if (this.material?.sentences[idx]) {
+          sentenceTranslation = this.material.sentences[idx].translation || sentenceTranslation;
+        }
+        const sourceUrl = String(ctx.sourceUrl ?? '');
+        // 对齐素材目录名：收藏视图「跳回原句」要用（openCached 按 dirName 打开）
+        const dirName = this.scanCached().find(
+          (c) => c.slug === slugFromUrl(sourceUrl) && c.hasAudio
+        )?.dirName;
+        const { fav: saved, deduped } = this.favs.add({
+          type,
+          text,
+          translation: type === 'sentence' ? sentenceTranslation : '',
+          pending: type !== 'sentence',
+          context: {
+            sentenceText: String(ctx.sentenceText ?? ''),
+            sentenceTranslation,
+            talkTitle: String(ctx.talkTitle ?? ''),
+            sourceUrl,
+            sentenceIndex: Number.isFinite(idx) ? idx : 0,
+            dirName,
+          },
+        });
+        // 整句译文已就绪；单词/短语配置了 API 就排队查询（结果写回条目）
+        if (type !== 'sentence' && this.isBaiduConfigured()) {
+          this.enqueueFavTranslation(saved, false);
+        }
+        this.pushFavorites();
+        this.webview.postMessage({ type: 'favAdded', deduped });
+        break;
+      }
+
+      case 'favRemove': {
+        const id = String(msg.id ?? '');
+        if (id) this.favs.remove(id);
+        this.pushFavorites();
+        break;
+      }
+
+      case 'favListRequest':
+        this.pushFavorites();
+        break;
+
+      case 'favRetry': {
+        // 手动「更新翻译」：只在用户进入收藏界面点按钮时才补译（不自动跑），
+        // 失败的条目保持 pending，下次再点继续重试
+        if (!this.isBaiduConfigured()) {
+          this.webview.postMessage({
+            type: 'notice',
+            message:
+              '请先在设置里填写百度翻译的 APP ID 与密钥（listeningTrainer.baiduAppId / baiduSecret）。',
+          });
+          break;
+        }
+        const pending = this.favs.list().filter((e) => e.pending);
+        this.favRemaining = pending.length;
+        this.pushFavorites(true);
+        if (!pending.length) break;
+        // 单请求批量查：q 用 \n 分行、百度按行返回（N 条只占 1 次请求额度），
+        // 超过单请求字节上限时 baiduTranslateBatch 内部自动分块（分块间仍走 QPS 间隔）
+        const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+        const appId = cfg.get<string>('baiduAppId', '').trim();
+        const secret = cfg.get<string>('baiduSecret', '').trim();
+        const proxy = cfg.get<string>('proxy', '') || undefined;
+        this.tQueue.push(async () => {
+          try {
+            const results = await baiduTranslateBatch(
+              pending.map((e) => e.text),
+              appId,
+              secret,
+              proxy
+            );
+            results.forEach((t, i) => {
+              if (t && pending[i]) this.favs.setTranslation(pending[i].id, t);
+            });
+            trace('[LT-TRACE] 批量翻译完成: ' + results.length + ' 条');
+          } catch (e: any) {
+            trace('[LT-TRACE] 批量翻译失败: ' + String(e?.message ?? e));
+          } finally {
+            this.favRemaining = 0;
+            this.pushFavorites(false);
+          }
+        }).catch(() => { /* 队列链已吞异常 */ });
+        break;
+      }
 
       case 'check': {
         const idx: number = msg.sentenceIndex;
@@ -739,6 +893,10 @@ export class PracticePanel {
             return;
           }
           const clamped = clampSentencesToAudio(m.sentences, info.durationMs);
+          // 收藏视图「跳回原句」：带上句号，pushMaterial 消费后自动复位
+          const jumpTo = Number(msg.sentenceIndex);
+          this.pendingJumpTo =
+            Number.isFinite(jumpTo) && jumpTo >= 0 ? Math.floor(jumpTo) : -1;
           // cacheDir 也按当前目录修正（删除素材时靠它判断「当前正在练的素材」）
           this.loadMaterial({ ...m, cacheDir: dir, sentences: clamped, audio: info, status: 'ready' });
         } catch (e: any) {
@@ -1038,7 +1196,10 @@ export class PracticePanel {
         // 传 null 时页面按 MP4 处理 —— v3 之后只会有 MP4。
         audioFormat: this.material.audio?.format ?? null,
       },
+      // 收藏视图「跳回原句」：-1 = 不跳（页面据此决定 currentIndex）
+      jumpTo: this.pendingJumpTo,
     });
+    this.pendingJumpTo = -1;
   }
 
   /**
@@ -1056,6 +1217,7 @@ export class PracticePanel {
       showAudioDiag: vscode.workspace
         .getConfiguration('listeningTrainer')
         .get<boolean>('showAudioDiagnostics', false),
+      baiduConfigured: this.isBaiduConfigured(),
     });
   }
 
@@ -1248,6 +1410,21 @@ export class PracticePanel {
   .bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
   .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 
+  /* ---- 答案面板点选收藏 ----
+   * token = 英文答案按词切开的可点击片段；选中高亮，相邻词可扩展成短语 */
+  .tok { cursor: pointer; border-radius: 3px; padding: 0 1px; }
+  .tok:hover { background: rgba(128,128,128,.18); }
+  .tok.sel { background: var(--accent); color: #fff; }
+  .fav-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  /* 收藏按钮是答案面板内的轻量操作，比全局按钮小一号 */
+  .fav-bar button { padding: 2px 8px; font-size: 11px; flex: 0 0 auto; }
+  .fav-bar .sel-text { color: var(--accent); font-size: 12px; }
+  /* 收藏视图里的义项小标签（一个词的多个释义拆开展示） */
+  .chip {
+    display: inline-block; padding: 1px 7px; margin: 1px 4px 1px 0;
+    border: 1px solid var(--border); border-radius: 8px; font-size: 11px;
+  }
+
   .player-err {
     display: none; margin-top: 8px; padding: 8px 10px;
     border-radius: 3px; font-size: 12px; line-height: 1.5;
@@ -1426,6 +1603,7 @@ export class PracticePanel {
        这样不会出现"切回练习界面却什么都没加载"的空转状态。 -->
   <button id="discoverBtn" class="ghost">发现 TED</button>
   <button id="libraryBtn" class="ghost">素材库</button>
+  <button id="favBtn" class="ghost">收藏</button>
   <button id="report" class="ghost">诊断报告</button>
   <!-- 布局切换：只在精听界面显示（文案是「点了会切到哪种布局」） -->
   <button id="layoutBtn" class="ghost" style="display:none">⇅ 上下布局</button>
@@ -1465,6 +1643,8 @@ export class PracticePanel {
   <div id="libList"></div>
   <div class="disc-foot" id="libFoot"></div>
 </div>
+
+<div id="favView" class="library"></div>
 
 <audio id="player" preload="auto"></audio>
 
@@ -1542,6 +1722,9 @@ player.addEventListener('pause', updatePlayBtn);
 const PLAY_MODE_ORDER = ['off', 'loop', 'auto'];
 const PLAY_MODE_LABEL = { off: '循环关', loop: '循环开', auto: '连播' };
 
+/** render() 最近一次渲染的句号 —— 用于判断「同句重渲染」（恢复滚动位置） */
+let renderedIndex = -1;
+
 let state = {
   material: null,
   currentIndex: 0,
@@ -1569,6 +1752,17 @@ let state = {
   // 默认关：音频链路已打通，这是留给开发者的排查工具，
   // 由 listeningTrainer.showAudioDiagnostics 控制（宿主在 ready / 配置变更时推）
   showAudioDiag: false,
+  /* ---- 收藏（单词/短语/整句） ---- */
+  // 百度翻译 API 是否已配置（宿主在 config / favList 里推）
+  baiduConfigured: false,
+  // 收藏列表（宿主 favList 推送，最新在前）
+  favorites: [],
+  // 收藏批次「更新翻译」进行中（按钮防连点）
+  favUpdating: false,
+  // 答案面板里当前选中的词 token 序号（连续短语）；favSelFor = 选区归属的句号，
+  // 切句后句号对不上自动失效，不用在每个切句入口清理
+  favSelFor: -1,
+  favSel: [],
 };
 
 // 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
@@ -1608,7 +1802,12 @@ window.addEventListener('message', (e) => {
   const msg = e.data;
   if (msg.type === 'material') {
     state.material = msg.material;
-    state.currentIndex = 0;
+    // 收藏视图「跳回原句」：宿主带句号就定位过去，否则从头开始
+    const jt = Number(msg.jumpTo);
+    state.currentIndex =
+      Number.isFinite(jt) && jt >= 0 && jt < (msg.material.sentences?.length ?? 0)
+        ? Math.floor(jt)
+        : 0;
     state.timingCount = msg.material.timingCount || 0;
     render();
   }
@@ -1636,7 +1835,26 @@ window.addEventListener('message', (e) => {
   // 影响渲染的配置（宿主在 ready 与配置变更时推；这里的 render 不动 currentIndex）
   if (msg.type === 'config') {
     state.showAudioDiag = !!msg.showAudioDiag;
+    state.baiduConfigured = !!msg.baiduConfigured;
+    if (currentView === 'favorites') renderFavView();
     render();
+  }
+  /* ---- 收藏 ---- */
+  // 收藏列表（进入收藏视图 / 增删 / 翻译批次进度时推送）。
+  // 练习界面也要刷新：整句收藏按钮的二态（收藏整句 ⇄ 已收藏）依赖这份列表
+  if (msg.type === 'favList') {
+    state.favorites = Array.isArray(msg.favorites) ? msg.favorites : [];
+    state.baiduConfigured = !!msg.baiduConfigured;
+    state.favUpdating = !!msg.updating;
+    if (currentView === 'favorites') renderFavView();
+    else if (currentView === 'practice') render();
+  }
+  // 收藏成功回执：清选区 + 轻提示 + 刷新按钮二态
+  if (msg.type === 'favAdded') {
+    state.favSel = [];
+    showNotice(msg.deduped ? '已在收藏中，来源句已更新' : '已收藏');
+    if (currentView === 'favorites') renderFavView();
+    else if (currentView === 'practice') render();
   }
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
   // ★ 下载来源区分（2026-09-19）：
@@ -1694,10 +1912,106 @@ window.addEventListener('message', (e) => {
   // 不要再在这里统一 showPracticeView() —— 那会把列表里的下载进度打断。
 });
 
+/* ---------------- 收藏视图 ---------------- */
+
+/**
+ * 收藏列表：词条 + 译文 + 来源句。
+ * - 未配置百度翻译 → 顶部提示条，pending 条目标 ⏳；
+ * - 已配置且有 pending → 显示「更新翻译」按钮（手动触发，QPS=1 串行）；
+ * - 点卡片跳回原句（宿主 openCached 带 sentenceIndex）；✕ 删除。
+ */
+function renderFavView() {
+  if (!favView) return;
+  const favs = state.favorites;
+  const pendingCount = favs.filter((f) => f.pending).length;
+
+  let html = '';
+  if (!state.baiduConfigured) {
+    html +=
+      '<div class="answer" style="margin-bottom:8px">' +
+        '<div class="lbl">单词/短语的译文需要百度翻译 API</div>' +
+        '在设置里搜索「listeningTrainer」，填写 <b>baiduAppId</b> 与 <b>baiduSecret</b>' +
+        '（fanyi-api.baidu.com 免费申请）。整句收藏不受影响，译文来自 TED 字幕。' +
+      '</div>';
+  } else if (pendingCount > 0) {
+    html +=
+      '<div class="disc-bar" style="margin-bottom:8px">' +
+        '<button id="favRetry" class="ghost"' + (state.favUpdating ? ' disabled' : '') + '>' +
+          (state.favUpdating ? '翻译中…' : '更新翻译（' + pendingCount + ' 条待译）') +
+        '</button>' +
+        '<span class="hint">按百度 QPS=1 串行执行，请稍候</span>' +
+      '</div>';
+  }
+
+  if (!favs.length) {
+    html += '<div class="center">还没有收藏。<br>' +
+      '在练习界面点「看答案」：点单词收藏单词，连续点相邻词收藏短语，也可以收藏整句。</div>';
+    favView.innerHTML = html;
+    return;
+  }
+
+  html += favs.map((f, k) => {
+    const ctx = f.context || {};
+    const trans = f.pending
+      ? '<span class="hint">⏳ 待翻译' +
+        (state.baiduConfigured ? '（点上方「更新翻译」补全）' : '（未配置百度翻译 API）') +
+        '</span>'
+      : f.type === 'sentence'
+        ? esc(f.translation).replace(/\\n/g, '<br>')
+        : // 百度把一个词的多义项合并在一个字符串里（「书；账簿；预订」），
+          // 按 ；/; 拆成 chip 展示，视觉上就是多个义项
+          esc(f.translation)
+            .split(/[；;]/)
+            .map((x) => x.trim())
+            .filter((x) => x)
+            .map((x) => '<span class="chip">' + x + '</span>')
+            .join('');
+    const canJump = !!ctx.dirName && typeof ctx.sentenceIndex === 'number';
+    const typeLabel = f.type === 'word' ? '单词' : (f.type === 'phrase' ? '短语' : '整句');
+    return '<div class="lib-card" data-k="' + k + '"' + (canJump ? '' : ' style="cursor:default"') + '>' +
+      '<div class="t">' + esc(f.text) +
+        '<span class="badge">' + typeLabel + '</span>' +
+        '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
+          'style="float:right;padding:0 6px" title="删除">✕</button>' +
+      '</div>' +
+      '<div class="meta">' + trans + '</div>' +
+      '<div class="meta">「' + esc(ctx.sentenceText || '') + '」' +
+        (ctx.sentenceTranslation ? '<br>译：' + esc(ctx.sentenceTranslation) : '') + '</div>' +
+      '<div class="meta hint">' + esc(ctx.talkTitle || '(未知课程)') +
+        ' · 句 ' + (Number(ctx.sentenceIndex) + 1) +
+        (canJump ? ' · 点击跳回原句' : '') + '</div>' +
+    '</div>';
+  }).join('');
+
+  favView.innerHTML = html;
+
+  const retry = document.getElementById('favRetry');
+  if (retry) retry.onclick = () => vscode.postMessage({ type: 'favRetry' });
+  favView.querySelectorAll('.fav-del').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'favRemove', id: btn.dataset.id });
+    };
+  });
+  favView.querySelectorAll('.lib-card').forEach((card) => {
+    card.onclick = () => {
+      const f = state.favorites[Number(card.dataset.k)];
+      if (!f || !f.context || !f.context.dirName) return;
+      vscode.postMessage({
+        type: 'openCached',
+        dirName: f.context.dirName,
+        sentenceIndex: f.context.sentenceIndex,
+      });
+      showPracticeView();
+    };
+  });
+}
+
 /* ---------------- 「发现 TED」浏览/搜索 ---------------- */
 
 const discView = document.getElementById('discover');
 const libView = document.getElementById('library');
+const favView = document.getElementById('favView');
 const libList = document.getElementById('libList');
 const libMeta = document.getElementById('libMeta');
 const discList = document.getElementById('discList');
@@ -1728,6 +2042,7 @@ const viewEls = {
   practice: document.getElementById('root'),
   discover: discView,
   library: libView,
+  favorites: favView,
   report: reportView,
 };
 let currentView = 'practice';
@@ -1738,6 +2053,7 @@ let currentView = 'practice';
 const navBtn = {
   discover: document.getElementById('discoverBtn'),
   library: document.getElementById('libraryBtn'),
+  favorites: document.getElementById('favBtn'),
   report: document.getElementById('report'),
 };
 
@@ -1795,6 +2111,13 @@ navBtn.library.onclick = () => {
   libMeta.textContent = '读取中…';
   libList.innerHTML = '';
   vscode.postMessage({ type: 'listCached' });
+};
+
+navBtn.favorites.onclick = () => {
+  if (currentView === 'favorites') return;
+  showView('favorites');
+  renderFavView();
+  vscode.postMessage({ type: 'favListRequest' });
 };
 
 function discLoad(page) {
@@ -2253,6 +2576,16 @@ function render() {
   const m = state.material;
   if (!m) return;
 
+  // ★ 同句重渲染（点选单词/收藏按钮等）不能让练习区滚动位置跳顶：
+  //   root.innerHTML 重建会【销毁重建】.practice 这个 overflow-y:auto 容器，
+  //   scrollTop 随之归零 —— 而答案面板在下半屏，一归零用户正在看的内容就被
+  //   甩出视野（2026-09-21 反馈「点词和收藏按钮都会跳回顶部」）。
+  //   做法：重建【前】记住位置（renderPractice 里取到的是新元素的 0），
+  //   重建后仅当句号没变（同句重渲染）才还原；切句则从顶部看新内容。
+  const oldPractice = document.getElementById('practice');
+  const prevPracticeScroll = oldPractice ? oldPractice.scrollTop : 0;
+  const sameIndex = renderedIndex === state.currentIndex;
+
   // 左右布局用 « »，上下布局用 ▴ ▾（朝向跟着布局走，不然会看不懂）
   const toggleArrow = state.stacked
     ? (state.listCollapsed ? '▾' : '▴')
@@ -2288,6 +2621,10 @@ function render() {
   bindListResize(document.getElementById('listToggle'));
 
   updateLayoutBtn();
+
+  const newPractice = document.getElementById('practice');
+  if (newPractice && sameIndex) newPractice.scrollTop = prevPracticeScroll;
+  renderedIndex = state.currentIndex;
 }
 
 function renderList() {
@@ -2438,6 +2775,34 @@ function adjTiming(kind, delta) {
   scheduleTimingPreview();
 }
 
+/* ---- 答案面板点选收藏 ---- */
+
+/** 把英文答案切成单词数组（撇号/连字符连写的词算一个词，如 don't、well-known） */
+function answerTokens(text) {
+  return text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
+}
+
+/**
+ * 答案渲染成「词 token + 原样分隔符」：
+ * 单词包 <span class="tok">，点击收藏；分隔符保持原样转义输出。
+ * 选区归属句号（favSelFor）不是当前句时不高亮 —— 切句后旧选区自动失效。
+ */
+function renderAnswerTokens(text) {
+  const words = text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
+  const sel = state.favSelFor === state.currentIndex ? state.favSel : [];
+  const re = /[A-Za-z]+(?:['’-][A-Za-z]+)*/g;
+  let out = '', last = 0, wi = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    out += esc(text.slice(last, m.index));
+    out += '<span class="tok' + (sel.indexOf(wi) >= 0 ? ' sel' : '') +
+      '" data-tok="' + wi + '">' + esc(m[0]) + '</span>';
+    wi++;
+    last = m.index + m[0].length;
+  }
+  out += esc(text.slice(last));
+  return out;
+}
+
 function renderPractice() {
   const m = state.material;
   const i = state.currentIndex;
@@ -2457,6 +2822,15 @@ function renderPractice() {
 
   const r = state.results[i];
   const p = document.getElementById('practice');
+
+  // 选区文本（选区归属当前句才有效），供「收藏所选」按钮展示与提交
+  const selActive = state.favSelFor === i && state.favSel.length > 0;
+  const selWords = answerTokens(s.text);
+  const selText = selActive ? state.favSel.map((k) => selWords[k]).join(' ') : '';
+  // 当前句是否已收藏（整句）。收藏去重键 = type+text（忽略大小写），对齐宿主
+  const sentFav = state.favorites.find(
+    (f) => f.type === 'sentence' && f.text.toLowerCase() === s.text.toLowerCase()
+  );
 
   let diffHtml = '';
   if (r) {
@@ -2523,7 +2897,18 @@ function renderPractice() {
 
     '<div class="answer" id="answerBox" style="display:' +
       (state.revealAnswer ? 'block' : 'none') + '">' +
-      '<div class="lbl">标准答案</div>' + esc(s.text) +
+      '<div class="lbl">标准答案（点击单词可选中，再点相邻词扩展成短语）</div>' +
+      renderAnswerTokens(s.text) +
+      '<div class="fav-bar">' +
+        // 有选区时只显示「收藏所选」（收藏整句隐藏）；无选区时只显示收藏整句
+        // 整句收藏二态：已收藏显示「已收藏」，再点取消收藏
+        (!selActive
+          ? '<button id="favSentence" class="ghost">' +
+            (sentFav ? '✓ 已收藏整句（点击取消）' : '⭐ 收藏整句') + '</button>'
+          : '<span class="sel-text">已选「' + esc(selText) + '」</span>' +
+            '<button id="favSelAdd" class="ghost">⭐ 收藏所选</button>' +
+            '<button id="favSelClear" class="ghost">取消选择</button>') +
+      '</div>' +
       (s.translation ? '<div class="lbl" style="margin-top:8px">译文</div>' + esc(s.translation) : '') +
     '</div>' +
 
@@ -2587,6 +2972,69 @@ function renderPractice() {
     state.revealAnswer = !state.revealAnswer;
     render();
   };
+
+  /* ---- 答案面板点选收藏 ---- */
+  // 点词：首次选中；点相邻词扩展成短语；点不相邻词重置为新选择；
+  // 再点已选中的唯一单词取消。选区只对当前句有效（favSelFor 锁句号）。
+  document.querySelectorAll('#answerBox .tok').forEach((el) => {
+    el.onclick = () => {
+      const wi = Number(el.dataset.tok);
+      if (state.favSelFor !== i) { state.favSelFor = i; state.favSel = []; }
+      const sel = state.favSel;
+      if (sel.indexOf(wi) >= 0) {
+        // 再点已选中的词 → 取消该词；一个不剩就回到初始状态
+        state.favSel = sel.filter((k) => k !== wi);
+        if (state.favSel.length === 0) state.favSelFor = -1;
+      } else if (sel.length === 0) {
+        state.favSel = [wi];
+      } else if (sel.indexOf(wi - 1) >= 0 || sel.indexOf(wi + 1) >= 0) {
+        state.favSel = sel.concat(wi).sort((a, b) => a - b);
+      } else {
+        state.favSel = [wi];
+      }
+      render();
+    };
+  });
+  const favContext = () => ({
+    sentenceText: s.text,
+    sentenceTranslation: s.translation || '',
+    talkTitle: m.title || '',
+    sourceUrl: m.sourceUrl || '',
+    sentenceIndex: i,
+  });
+  const favSelAdd = document.getElementById('favSelAdd');
+  if (favSelAdd) {
+    favSelAdd.onclick = () => {
+      const text = state.favSel.map((k) => selWords[k]).join(' ');
+      if (!text) return;
+      vscode.postMessage({
+        type: 'favAdd',
+        fav: { type: state.favSel.length > 1 ? 'phrase' : 'word', text, context: favContext() },
+      });
+      state.favSel = [];
+      render();
+    };
+  }
+  const favSelClear = document.getElementById('favSelClear');
+  if (favSelClear) {
+    favSelClear.onclick = () => { state.favSel = []; render(); };
+  }
+  const favSentence = document.getElementById('favSentence');
+  if (favSentence) {
+    favSentence.onclick = () => {
+      if (sentFav) {
+        // 已收藏 → 取消收藏。本地先行移除让按钮立即变回，宿主回推 favList 再对账
+        vscode.postMessage({ type: 'favRemove', id: sentFav.id });
+        state.favorites = state.favorites.filter((f) => f.id !== sentFav.id);
+      } else {
+        vscode.postMessage({
+          type: 'favAdd',
+          fav: { type: 'sentence', text: s.text, context: favContext() },
+        });
+      }
+      render();
+    };
+  }
   document.getElementById('check').onclick = doCheck;
 
   // 诊断按钮默认不存在（开发者开关关着），绑定必须判空

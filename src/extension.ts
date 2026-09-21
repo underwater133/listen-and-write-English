@@ -183,9 +183,15 @@ export function activate(context: vscode.ExtensionContext): void {
         handleMaterialsDirChange();
       }
       // 影响页面渲染的配置：立即推给当前面板，不必重载窗口
-      // （用户改完设置想马上看到按钮出现/消失）
-      if (e.affectsConfiguration('listeningTrainer.showAudioDiagnostics')) {
+      // （用户改完设置想马上看到提示条消失/出现）
+      if (
+        e.affectsConfiguration('listeningTrainer.showAudioDiagnostics') ||
+        e.affectsConfiguration('listeningTrainer.baiduAppId') ||
+        e.affectsConfiguration('listeningTrainer.baiduSecret')
+      ) {
+        // 侧边栏与编辑器面板是两个实例，都要收到（收藏视图在哪个都能看到最新状态）
         PracticePanel.current?.pushConfig();
+        PracticePanel.sidebar?.pushConfig();
       }
     })
   );

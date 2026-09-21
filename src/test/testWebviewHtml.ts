@@ -545,6 +545,95 @@ check(
   '答案面板显隐挂在会被 render() 重置的 DOM style 上，切句就消失'
 );
 
+/* ---------- 收藏（单词/短语/整句 + 百度翻译） ---------- */
+
+const favSrc = fs.readFileSync(path.join(__dirname, '../../src/core/favorites.ts'), 'utf8');
+
+check(
+  'package.json: 有 listeningTrainer.baiduAppId / baiduSecret 配置',
+  /listeningTrainer\.baiduAppId/.test(pkg) && /listeningTrainer\.baiduSecret/.test(pkg),
+  '没有配置项用户就没法填百度翻译凭证'
+);
+check(
+  'favorites.ts: 签名规则 MD5(appid+q+salt+secret) 且 QPS 间隔 ≥1100ms',
+  /createHash\('md5'\)/.test(favSrc) &&
+    /appId \+ q \+ salt \+ secret/.test(favSrc) &&
+    /BAIDU_QPS_INTERVAL_MS = 1100/.test(favSrc),
+  '签名或 QPS 间隔不符合百度翻译 API 规范'
+);
+check(
+  'favorites.ts: FavoriteStore 支持去重收藏（同词条更新 context 不新增）',
+  /toLowerCase\(\)/.test(favSrc) && /deduped: true/.test(favSrc),
+  '重复收藏同一词条会产生脏数据'
+);
+check(
+  'panel.ts(宿主): 收藏通道齐全 favAdd/favRemove/favListRequest/favRetry',
+  /case 'favAdd'/.test(panel) && /case 'favRemove'/.test(panel) &&
+    /case 'favListRequest'/.test(panel) && /case 'favRetry'/.test(panel),
+  'webview 与宿主的收藏消息没接全'
+);
+check(
+  'panel.ts(宿主): 整句译文以宿主素材为权威，单词/短语走队列翻译',
+  /sentenceTranslation = this\.material\.sentences\[idx\]\.translation/.test(panel) &&
+    /enqueueFavTranslation\(saved, false\)/.test(panel),
+  '整句译文必须复用 TED 字幕（不调 API），单词/短语查询必须进串行队列'
+);
+check(
+  'panel.ts(页面): 答案面板 token 化（.tok 可点选，data-tok 序号）',
+  /class="tok' \+ \(sel\.indexOf\(wi\)/.test(panel) && /renderAnswerTokens/.test(panel),
+  '答案没有 token 化，无法点选单词收藏'
+);
+check(
+  'panel.ts(页面): 收藏视图存在（favBtn 导航 + favView 容器 + renderFavView）',
+  /id="favBtn"/.test(panel) && /id="favView"/.test(panel) && /function renderFavView/.test(panel),
+  '收藏视图没接进导航'
+);
+check(
+  'panel.ts(页面): 未配置 API 显示提示条；有 pending 且已配置才显示「更新翻译」',
+  /单词\/短语的译文需要百度翻译 API/.test(panel) &&
+    /id="favRetry"/.test(panel) &&
+    /pendingCount > 0/.test(panel),
+  '未配置/中途配置 API 的显示状态没处理'
+);
+check(
+  'panel.ts: 收藏视图跳回原句（openCached 带 sentenceIndex，pushMaterial 带 jumpTo）',
+  /jumpTo: this\.pendingJumpTo/.test(panel) && /sentenceIndex: f\.context\.sentenceIndex/.test(panel) &&
+    /state\.currentIndex =\s*\n?\s*Number\.isFinite\(jt\)/.test(panel),
+  '跳回原句的链路没接通，点击收藏卡片只会打开素材第一句'
+);
+check(
+  'panel.ts: 收藏整句二态切换，且有选区时隐藏收藏整句',
+  /sentFav \? '✓ 已收藏整句（点击取消）' : '⭐ 收藏整句'/.test(panel) &&
+    /!\s*selActive\s*\n?\s*\? '<button id="favSentence"/.test(panel) &&
+    /type: 'favRemove', id: sentFav\.id/.test(panel),
+  '收藏整句不是二态按钮，或选区与整句按钮同时出现'
+);
+check(
+  'favorites.ts: 批量翻译按 \\n 分行合并为单请求，超限自动分块',
+  /baiduTranslateBatch/.test(favSrc) &&
+    /texts\.join\('\\n'\)/.test(favSrc) &&
+    /bytes \+ b > 5000/.test(favSrc),
+  '批量翻译没合并请求（N 条 N 个请求会浪费额度还慢）'
+);
+check(
+  'panel.ts: 词条译文按 ； 拆成 chip 展示（整句不拆）',
+  /\.split\(\/\[；;]/.test(panel) && /class="chip"/.test(panel) && /f\.type === 'sentence'/.test(panel),
+  '多义项挤在一个字符串里，看不出是几个释义'
+);
+check(
+  'panel.ts: 点选单词后练习区滚动位置保持（root 重建【前】记录 scrollTop，同句才还原）',
+  /const prevPracticeScroll = oldPractice \? oldPractice\.scrollTop : 0;/.test(panel) &&
+    /const sameIndex = renderedIndex === state\.currentIndex;/.test(panel) &&
+    /if \(newPractice && sameIndex\) newPractice\.scrollTop = prevPracticeScroll;/.test(panel),
+  '滚动位置必须在 root.innerHTML 重建前记录（重建后取到的是新元素的 0）'
+);
+check(
+  'panel.ts: 再点已选中的词取消选中，选空后回到初始状态',
+  /state\.favSel = sel\.filter\(\(k\) => k !== wi\);/.test(panel) &&
+    /if \(state\.favSel\.length === 0\) state\.favSelFor = -1;/.test(panel),
+  '已选中的词点不掉'
+);
+
 // ★ 回归防线：「已下载」必须按 slug 对齐。
 // 真实事故（2026-09-19）：搜索结果 hit.id 是 Algolia objectID（3292），
 // 素材库 id 是 ted:<videoData.id>（66），按 id 对齐永远标不上「已下载」。

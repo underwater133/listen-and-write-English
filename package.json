@@ -110,6 +110,16 @@
           "type": "boolean",
           "default": false,
           "description": "在练习界面显示音频加载诊断按钮（🔧）。仅用于排查音频播放问题，日常使用无需开启。"
+        },
+        "listeningTrainer.baiduAppId": {
+          "type": "string",
+          "default": "",
+          "description": "百度翻译开放平台 APP ID（用于收藏的单词/短语翻译）。申请：fanyi-api.baidu.com → 注册并实名认证 → 创建应用。留空则整句翻译仍可用（来自 TED 字幕），单词/短语标记为待翻译。"
+        },
+        "listeningTrainer.baiduSecret": {
+          "type": "string",
+          "default": "",
+          "description": "百度翻译开放平台应用密钥。与 APP ID 配套填写；两者都填后，在收藏界面点「更新翻译」即可补全待翻译条目。"
         }
       }
     }
