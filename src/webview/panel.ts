@@ -177,7 +177,7 @@ export class PracticePanel {
     }
 
     const panel = vscode.window.createWebviewPanel(
-      'listeningTrainer',
+      'listenAndWrite',
       'Listen & Write · 听写英语',
       column,
       {
@@ -295,7 +295,7 @@ export class PracticePanel {
 
   /** 百度翻译 API 是否已配置（appId 与密钥都非空） */
   private isBaiduConfigured(): boolean {
-    const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+    const cfg = vscode.workspace.getConfiguration('listenAndWrite');
     return !!cfg.get<string>('baiduAppId', '').trim() && !!cfg.get<string>('baiduSecret', '').trim();
   }
 
@@ -317,7 +317,7 @@ export class PracticePanel {
   private enqueueFavTranslation(fav: FavoriteEntry, batch: boolean): void {
     this.tQueue.push(async () => {
       try {
-        const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+        const cfg = vscode.workspace.getConfiguration('listenAndWrite');
         const appId = cfg.get<string>('baiduAppId', '').trim();
         const secret = cfg.get<string>('baiduSecret', '').trim();
         if (!appId || !secret) return;
@@ -618,7 +618,7 @@ export class PracticePanel {
           this.webview.postMessage({
             type: 'notice',
             message:
-              '请先在设置里填写百度翻译的 APP ID 与密钥（listeningTrainer.baiduAppId / baiduSecret）。',
+              '请先在设置里填写百度翻译的 APP ID 与密钥（listenAndWrite.baiduAppId / baiduSecret）。',
           });
           break;
         }
@@ -628,7 +628,7 @@ export class PracticePanel {
         if (!pending.length) break;
         // 单请求批量查：q 用 \n 分行、百度按行返回（N 条只占 1 次请求额度），
         // 超过单请求字节上限时 baiduTranslateBatch 内部自动分块（分块间仍走 QPS 间隔）
-        const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+        const cfg = vscode.workspace.getConfiguration('listenAndWrite');
         const appId = cfg.get<string>('baiduAppId', '').trim();
         const secret = cfg.get<string>('baiduSecret', '').trim();
         const proxy = cfg.get<string>('proxy', '') || undefined;
@@ -1079,7 +1079,7 @@ export class PracticePanel {
 
     // 2) 联网拉页面（走与素材源同一套代理设置）
     const proxy =
-      vscode.workspace.getConfiguration('listeningTrainer').get<string>('proxy', '') || undefined;
+      vscode.workspace.getConfiguration('listenAndWrite').get<string>('proxy', '') || undefined;
     const html = await httpGetText(`https://www.ted.com/talks/${slug}`, { proxy });
     const json = extractNextDataJson(html);
     if (!json) throw new Error('页面结构已变更，取不到简介。');
@@ -1215,7 +1215,7 @@ export class PracticePanel {
     this.webview.postMessage({
       type: 'config',
       showAudioDiag: vscode.workspace
-        .getConfiguration('listeningTrainer')
+        .getConfiguration('listenAndWrite')
         .get<boolean>('showAudioDiagnostics', false),
       baiduConfigured: this.isBaiduConfigured(),
     });
@@ -1750,7 +1750,7 @@ let state = {
   timingCount: 0,
   // 是否显示音频加载诊断按钮（🔧）。
   // 默认关：音频链路已打通，这是留给开发者的排查工具，
-  // 由 listeningTrainer.showAudioDiagnostics 控制（宿主在 ready / 配置变更时推）
+  // 由 listenAndWrite.showAudioDiagnostics 控制（宿主在 ready / 配置变更时推）
   showAudioDiag: false,
   /* ---- 收藏（单词/短语/整句） ---- */
   // 百度翻译 API 是否已配置（宿主在 config / favList 里推）
@@ -1930,7 +1930,7 @@ function renderFavView() {
     html +=
       '<div class="answer" style="margin-bottom:8px">' +
         '<div class="lbl">单词/短语的译文需要百度翻译 API</div>' +
-        '在设置里搜索「listeningTrainer」，填写 <b>baiduAppId</b> 与 <b>baiduSecret</b>' +
+        '在设置里搜索「listenAndWrite」，填写 <b>baiduAppId</b> 与 <b>baiduSecret</b>' +
         '（fanyi-api.baidu.com 免费申请）。整句收藏不受影响，译文来自 TED 字幕。' +
       '</div>';
   } else if (pendingCount > 0) {
@@ -2477,7 +2477,7 @@ function showError(text, hint) {
     '<div style="color:var(--err);margin-bottom:6px;">加载失败</div>' +
     '<div class="hint">' + esc(text) + '</div>' +
     '<div class="hint" style="margin-top:12px;">' +
-      esc(hint || '如果是网络问题，请在设置中配置 listeningTrainer.proxy') +
+      esc(hint || '如果是网络问题，请在设置中配置 listenAndWrite.proxy') +
     '</div>' +
     '</div></div>';
 }
@@ -2864,7 +2864,7 @@ function renderPractice() {
       '<button id="next" class="ghost">下一句</button>' +
       '<button id="rate" class="ghost">' + state.rate + 'x</button>' +
       '<button id="loop" class="ghost">' + PLAY_MODE_LABEL[state.playMode] + '</button>' +
-      // 音频诊断是开发者工具：默认不渲染（listeningTrainer.showAudioDiagnostics）
+      // 音频诊断是开发者工具：默认不渲染（listenAndWrite.showAudioDiagnostics）
       (state.showAudioDiag
         ? '<button id="diag" class="ghost" title="诊断音频加载">🔧</button>'
         : '') +
@@ -3380,7 +3380,7 @@ async function playCurrent() {
       (state.showAudioDiag
         ? '请点 🔧 查看诊断详情（含容器判定与播放器能力），并把扩展宿主输出里的 [LT-TRACE] 行发出来。'
         : '把扩展宿主输出里的 [LT-TRACE] 行发出来即可定位；需要更详细的现场信息时，' +
-          '可在设置里开启 listeningTrainer.showAudioDiagnostics，界面上会出现 🔧 诊断按钮。')
+          '可在设置里开启 listenAndWrite.showAudioDiagnostics，界面上会出现 🔧 诊断按钮。')
     );
     return;
   }

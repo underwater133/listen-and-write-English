@@ -112,7 +112,7 @@ function once(url: string, opts: HttpOptions): Promise<Buffer> {
             new Error(
               `HTTP 403 —— 被 TED 反爬拦截（automated access is not permitted）。\n` +
                 `这通常意味着请求特征被识别为自动化。可尝试：\n` +
-                `  1. 配置 listeningTrainer.proxy 走代理\n` +
+                `  1. 配置 listenAndWrite.proxy 走代理\n` +
                 `  2. 稍后重试（TED 的拦截有时是短时的）\n` +
                 `  URL: ${url}`
             )

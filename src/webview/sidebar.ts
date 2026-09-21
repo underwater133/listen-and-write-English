@@ -18,7 +18,7 @@ import * as vscode from 'vscode';
 import { PracticePanel, PanelDeps } from './panel';
 
 export class SidebarViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'listeningTrainer.practice';
+  public static readonly viewType = 'listenAndWrite.practice';
 
   constructor(
     private readonly ctx: vscode.ExtensionContext,

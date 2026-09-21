@@ -131,7 +131,7 @@ export interface AudioInfo {
  * 按素材目录重新定位音频文件，返回可用路径；找不到返回 null。
  *
  * ⚠️ audio.json 里的 path 是【写入时的绝对路径】。素材目录一旦整体搬迁
- *    （`listeningTrainer.materialsDir` 变更时扩展会自动搬运），旧路径必然失效：
+ *    （`listenAndWrite.materialsDir` 变更时扩展会自动搬运），旧路径必然失效：
  *      - panel.openCached 判 existsSync(path) 失败 → 误报「音频缓存已过期」
  *      - panel.tryRestoreLast 的 readFileSync 抛错被 catch → 素材被静默跳过
  *      - 就算判据放行，推给 webview 的 audioUri 也指向不存在的旧位置 → 播放失败

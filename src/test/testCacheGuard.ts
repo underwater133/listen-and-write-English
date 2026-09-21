@@ -92,7 +92,7 @@ function main(): void {
 
   /* ---------- 6. 素材目录迁移后的路径重定位 ----------
    *
-   * 真实事故（2026-09-19）：配置 `listeningTrainer.materialsDir` 后，素材被
+   * 真实事故（2026-09-19）：配置 `listenAndWrite.materialsDir` 后，素材被
    * 自动搬到新目录，但 audio.json 里存的仍是旧绝对路径。点素材库卡片报
    * 「该素材的音频缓存已过期」——而 audio.mp3 就好好躺在当前目录里。
    */

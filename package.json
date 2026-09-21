@@ -30,16 +30,16 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "listeningTrainer",
+          "id": "listenAndWrite",
           "title": "Listen & Write",
           "icon": "media/icon.svg"
         }
       ]
     },
     "views": {
-      "listeningTrainer": [
+      "listenAndWrite": [
         {
-          "id": "listeningTrainer.practice",
+          "id": "listenAndWrite.practice",
           "name": "听写练习",
           "type": "webview"
         }
@@ -47,41 +47,41 @@
     },
     "commands": [
       {
-        "command": "listeningTrainer.openPractice",
+        "command": "listenAndWrite.openPractice",
         "title": "Listen & Write: 打开精听练习",
         "icon": "$(play)"
       },
       {
-        "command": "listeningTrainer.loadTed",
+        "command": "listenAndWrite.loadTed",
         "title": "Listen & Write: 从 TED 链接加载素材"
       },
       {
-        "command": "listeningTrainer.loadLocal",
+        "command": "listenAndWrite.loadLocal",
         "title": "Listen & Write: 从本地音频加载素材"
       },
       {
-        "command": "listeningTrainer.showReport",
+        "command": "listenAndWrite.showReport",
         "title": "Listen & Write: 查看听力诊断报告"
       },
       {
-        "command": "listeningTrainer.clearCache",
+        "command": "listenAndWrite.clearCache",
         "title": "Listen & Write: 清除音频缓存"
       }
     ],
     "configuration": {
       "title": "Listen & Write",
       "properties": {
-        "listeningTrainer.proxy": {
+        "listenAndWrite.proxy": {
           "type": "string",
           "default": "",
           "description": "访问 TED 时使用的代理，如 http://127.0.0.1:7890。留空则跟随系统/VS Code http.proxy 设置。"
         },
-        "listeningTrainer.materialsDir": {
+        "listenAndWrite.materialsDir": {
           "type": "string",
           "default": "",
           "description": "素材存放位置（绝对路径），如 D:\\ListeningMaterials。留空使用默认位置（扩展全局存储下的 materials 目录）。修改后已下载的素材会自动迁移到新位置，重载窗口生效。"
         },
-        "listeningTrainer.audioQuality": {
+        "listenAndWrite.audioQuality": {
           "type": "string",
           "enum": [
             "low",
@@ -91,32 +91,32 @@
           "default": "medium",
           "description": "音频质量。medium 约 138kbps / 8MB 每 8 分钟。"
         },
-        "listeningTrainer.concurrency": {
+        "listenAndWrite.concurrency": {
           "type": "number",
           "default": 6,
           "description": "分片下载并发数。"
         },
-        "listeningTrainer.autoReplayOnError": {
+        "listenAndWrite.autoReplayOnError": {
           "type": "boolean",
           "default": true,
           "description": "听写错误时自动重播该句。"
         },
-        "listeningTrainer.skipIntro": {
+        "listenAndWrite.skipIntro": {
           "type": "boolean",
           "default": true,
           "description": "裁掉 TED 片头（3.527s）。关闭后需用 VTT 原始时间轴。"
         },
-        "listeningTrainer.showAudioDiagnostics": {
+        "listenAndWrite.showAudioDiagnostics": {
           "type": "boolean",
           "default": false,
           "description": "在练习界面显示音频加载诊断按钮（🔧）。仅用于排查音频播放问题，日常使用无需开启。"
         },
-        "listeningTrainer.baiduAppId": {
+        "listenAndWrite.baiduAppId": {
           "type": "string",
           "default": "",
           "description": "百度翻译开放平台 APP ID（用于收藏的单词/短语翻译）。申请：fanyi-api.baidu.com → 注册并实名认证 → 创建应用。留空则整句翻译仍可用（来自 TED 字幕），单词/短语标记为待翻译。"
         },
-        "listeningTrainer.baiduSecret": {
+        "listenAndWrite.baiduSecret": {
           "type": "string",
           "default": "",
           "description": "百度翻译开放平台应用密钥。与 APP ID 配套填写；两者都填后，在收藏界面点「更新翻译」即可补全待翻译条目。"

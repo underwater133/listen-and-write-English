@@ -120,7 +120,7 @@ function migrateMaterials(from: string, to: string): { moved: number; skipped: n
  */
 function handleMaterialsDirChange(): void {
   const newCfg = vscode.workspace
-    .getConfiguration('listeningTrainer')
+    .getConfiguration('listenAndWrite')
     .get<string>('materialsDir', '');
   const newRoot = resolveCacheRoot(newCfg);
   if (newRoot === cacheRoot) return;
@@ -159,7 +159,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(outChannel);
 
   defaultCacheRoot = path.join(context.globalStorageUri.fsPath, 'materials');
-  const cfg = vscode.workspace.getConfiguration('listeningTrainer');
+  const cfg = vscode.workspace.getConfiguration('listenAndWrite');
   cacheRoot = resolveCacheRoot(cfg.get<string>('materialsDir', ''));
   fs.mkdirSync(cacheRoot, { recursive: true });
   trace('activate: cacheRoot = ' + cacheRoot);
@@ -179,15 +179,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('listeningTrainer.materialsDir')) {
+      if (e.affectsConfiguration('listenAndWrite.materialsDir')) {
         handleMaterialsDirChange();
       }
       // 影响页面渲染的配置：立即推给当前面板，不必重载窗口
       // （用户改完设置想马上看到提示条消失/出现）
       if (
-        e.affectsConfiguration('listeningTrainer.showAudioDiagnostics') ||
-        e.affectsConfiguration('listeningTrainer.baiduAppId') ||
-        e.affectsConfiguration('listeningTrainer.baiduSecret')
+        e.affectsConfiguration('listenAndWrite.showAudioDiagnostics') ||
+        e.affectsConfiguration('listenAndWrite.baiduAppId') ||
+        e.affectsConfiguration('listenAndWrite.baiduSecret')
       ) {
         // 侧边栏与编辑器面板是两个实例，都要收到（收藏视图在哪个都能看到最新状态）
         PracticePanel.current?.pushConfig();
@@ -223,11 +223,11 @@ export function activate(context: vscode.ExtensionContext): void {
       { webviewOptions: { retainContextWhenHidden: true } }
     ),
 
-    vscode.commands.registerCommand('listeningTrainer.openPractice', () => {
+    vscode.commands.registerCommand('listenAndWrite.openPractice', () => {
       PracticePanel.createOrShow(context, panelDeps);
     }),
 
-    vscode.commands.registerCommand('listeningTrainer.loadTed', async () => {
+    vscode.commands.registerCommand('listenAndWrite.loadTed', async () => {
       const url = await vscode.window.showInputBox({
         title: '从 TED 加载素材',
         prompt: '粘贴 TED talk 链接',
@@ -276,7 +276,7 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
 
-    vscode.commands.registerCommand('listeningTrainer.loadLocal', async () => {
+    vscode.commands.registerCommand('listenAndWrite.loadLocal', async () => {
       const uris = await vscode.window.showOpenDialog({
         canSelectMany: false,
         filters: { 音频: ['aac', 'mp3', 'm4a', 'wav'] },
@@ -288,12 +288,12 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
 
-    vscode.commands.registerCommand('listeningTrainer.showReport', () => {
+    vscode.commands.registerCommand('listenAndWrite.showReport', () => {
       PracticePanel.createOrShow(context, panelDeps);
       PracticePanel.current?.showReport();
     }),
 
-    vscode.commands.registerCommand('listeningTrainer.clearCache', async () => {
+    vscode.commands.registerCommand('listenAndWrite.clearCache', async () => {
       const pick = await vscode.window.showWarningMessage(
         '确定清空所有已下载的音频缓存？',
         { modal: true },

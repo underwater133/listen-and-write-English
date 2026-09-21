@@ -550,8 +550,8 @@ check(
 const favSrc = fs.readFileSync(path.join(__dirname, '../../src/core/favorites.ts'), 'utf8');
 
 check(
-  'package.json: 有 listeningTrainer.baiduAppId / baiduSecret 配置',
-  /listeningTrainer\.baiduAppId/.test(pkg) && /listeningTrainer\.baiduSecret/.test(pkg),
+  'package.json: 有 listenAndWrite.baiduAppId / baiduSecret 配置',
+  /listenAndWrite\.baiduAppId/.test(pkg) && /listenAndWrite\.baiduSecret/.test(pkg),
   '没有配置项用户就没法填百度翻译凭证'
 );
 check(
@@ -679,7 +679,7 @@ check('panel.ts: 含 diagContent 诊断容器', /id="diagContent"/.test(panel));
 
 /* ---------- 音频诊断按钮：改为开发者开关（2026-09-19） ----------
  * 音频链路打通后，🔧 不该再对普通用户暴露 —— 改由
- * listeningTrainer.showAudioDiagnostics 控制（默认关）。
+ * listenAndWrite.showAudioDiagnostics 控制（默认关）。
  *
  * 锁这几点，缺一个都会退化：
  *   - 开关默认必须是 false（否则等于没隐藏）
@@ -689,9 +689,9 @@ check('panel.ts: 含 diagContent 诊断容器', /id="diagContent"/.test(panel));
  *   - 播放失败提示不能指向一个不存在的 🔧 按钮
  */
 check(
-  'package.json: 有 listeningTrainer.showAudioDiagnostics（默认 false）',
-  /"listeningTrainer\.showAudioDiagnostics"/.test(pkg) &&
-    /"listeningTrainer\.showAudioDiagnostics"[\s\S]{0,220}?"default":\s*false/.test(pkg),
+  'package.json: 有 listenAndWrite.showAudioDiagnostics（默认 false）',
+  /"listenAndWrite\.showAudioDiagnostics"/.test(pkg) &&
+    /"listenAndWrite\.showAudioDiagnostics"[\s\S]{0,220}?"default":\s*false/.test(pkg),
   '缺少开发者开关，或默认值不是 false —— 普通用户仍会看到 🔧'
 );
 check(
@@ -710,7 +710,7 @@ check(
   'panel.ts + extension.ts: 开关经 config 消息下发（ready 时 + 配置变更时）',
   /type: 'config'/.test(panel) &&
     /case 'ready':[\s\S]{0,160}pushConfig\(\)/.test(panel) &&
-    /affectsConfiguration\('listeningTrainer\.showAudioDiagnostics'\)/.test(extSrc),
+    /affectsConfiguration\('listenAndWrite\.showAudioDiagnostics'\)/.test(extSrc),
   '改设置要重载窗口才生效'
 );
 check(
