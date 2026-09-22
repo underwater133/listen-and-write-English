@@ -213,6 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
     adapters,
     cacheRoot,
     storage: context.globalStorageUri.fsPath,
+    dictPath: path.join(context.extensionPath, 'assets', 'dict.json.gz'),
   };
 
   context.subscriptions.push(

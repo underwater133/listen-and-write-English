@@ -601,6 +601,42 @@ check(
     /state\.currentIndex =\s*\n?\s*Number\.isFinite\(jt\)/.test(panel),
   '跳回原句的链路没接通，点击收藏卡片只会打开素材第一句'
 );
+
+/* ---------- 离线词典（ECDICT 子集） ---------- */
+
+const dictSrc = fs.readFileSync(path.join(__dirname, '../../src/core/dictionary.ts'), 'utf8');
+
+check(
+  'dictionary.ts: 词典单例 + 惰性加载 + 失败静默降级（不抛错）',
+  /function getDictionary/.test(dictSrc) &&
+    /ensureLoaded/.test(dictSrc) &&
+    /this\.broken = true/.test(dictSrc),
+  '词典加载失败不能把宿主打挂，必须静默降级走百度'
+);
+check(
+  'dictionary.ts: 词形还原三层（精确 → lemma 映射 → 规则剥离）',
+  /this\.lemma\.get\(c\)/.test(dictSrc) && /function stripSuffixes/.test(dictSrc),
+  'went→go 这类不规则变形必须靠 lemma 映射，规则剥离只是兜底'
+);
+check(
+  'panel.ts(宿主): 查词管线词典优先（单词未命中才走百度）',
+  /const entry = await this\.lookupDict\(text\);/.test(panel) &&
+    /case 'favWordLookup'/.test(panel) &&
+    /baiduTranslateBatch/.test(panel),
+  '离线词典必须优先于百度 API'
+);
+check(
+  'panel.ts(页面): 词条显示音标；短语可点词展开',
+  /class="phonetic"/.test(panel) && /class="ptok"/.test(panel) &&
+    /type: 'favWordLookup'/.test(panel) && /state\.favExpand/.test(panel),
+  '音标/短语点词的展示与交互缺失'
+);
+check(
+  '构建: 词典构建脚本与产物存在',
+  fs.existsSync(path.join(__dirname, '../../scripts/build-dict.mjs')) &&
+    fs.existsSync(path.join(__dirname, '../../assets/dict.json.gz')),
+  '词典数据或构建脚本缺失，离线查词会全部走百度'
+);
 check(
   'panel.ts: 收藏整句二态切换，且有选区时隐藏收藏整句',
   /sentFav \? '✓ 已收藏整句（点击取消）' : '⭐ 收藏整句'/.test(panel) &&
@@ -617,7 +653,7 @@ check(
 );
 check(
   'panel.ts: 词条译文按 ； 拆成 chip 展示（整句不拆）',
-  /\.split\(\/\[；;]/.test(panel) && /class="chip"/.test(panel) && /f\.type === 'sentence'/.test(panel),
+  /\.split\(\/\[；;/.test(panel) && /class="chip"/.test(panel) && /f\.type === 'sentence'/.test(panel),
   '多义项挤在一个字符串里，看不出是几个释义'
 );
 check(

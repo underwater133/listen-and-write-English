@@ -35,12 +35,15 @@ import {
 } from '../core/timing';
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
+import { getDictionary } from '../core/dictionary';
 import { MistakeStore, trace } from '../extension';
 
 export interface PanelDeps {
   adapters: MaterialSourceAdapter[];
   cacheRoot: string;
   storage: string;
+  /** 离线词典（ECDICT 子集）文件路径 */
+  dictPath: string;
 }
 
 /** 素材库列表项（已缓存素材的概要） */
@@ -297,6 +300,11 @@ export class PracticePanel {
   private isBaiduConfigured(): boolean {
     const cfg = vscode.workspace.getConfiguration('listenAndWrite');
     return !!cfg.get<string>('baiduAppId', '').trim() && !!cfg.get<string>('baiduSecret', '').trim();
+  }
+
+  /** 离线词典查询（单例共享）。未命中/词典不可用返回 null，调用方走百度兜底 */
+  private async lookupDict(word: string): Promise<{ phonetic: string; translation: string } | null> {
+    return getDictionary(this.deps.dictPath).lookup(word);
   }
 
   /** 把收藏列表（+配置状态+批次进度）推给页面 */
@@ -591,9 +599,22 @@ export class PracticePanel {
             dirName,
           },
         });
-        // 整句译文已就绪；单词/短语配置了 API 就排队查询（结果写回条目）
-        if (type !== 'sentence' && this.isBaiduConfigured()) {
-          this.enqueueFavTranslation(saved, false);
+        // 查词管线：单词先查离线词典（音标+释义，本地零成本），未命中走百度；
+        // 短语直接百度；整句译文已就绪（来自 TED 字幕）
+        if (type !== 'sentence') {
+          if (type === 'word') {
+            const entry = await this.lookupDict(text);
+            if (entry) {
+              this.favs.setTranslation(saved.id, entry.translation);
+              this.favs.setPhonetic(saved.id, entry.phonetic);
+              this.pushFavorites();
+              this.webview.postMessage({ type: 'favAdded', deduped });
+              break;
+            }
+          }
+          if (this.isBaiduConfigured()) {
+            this.enqueueFavTranslation(saved, false);
+          }
         }
         this.pushFavorites();
         this.webview.postMessage({ type: 'favAdded', deduped });
@@ -623,9 +644,22 @@ export class PracticePanel {
           break;
         }
         const pending = this.favs.list().filter((e) => e.pending);
-        this.favRemaining = pending.length;
-        this.pushFavorites(true);
-        if (!pending.length) break;
+        // 统一查词管线：单词先查离线词典（本地、零成本），未命中的再进百度批量
+        const baiduTargets: FavoriteEntry[] = [];
+        for (const e of pending) {
+          if (e.type === 'word') {
+            const entry = await this.lookupDict(e.text);
+            if (entry) {
+              this.favs.setTranslation(e.id, entry.translation);
+              this.favs.setPhonetic(e.id, entry.phonetic);
+              continue;
+            }
+          }
+          baiduTargets.push(e);
+        }
+        this.favRemaining = baiduTargets.length;
+        this.pushFavorites(this.favRemaining > 0);
+        if (!baiduTargets.length) break;
         // 单请求批量查：q 用 \n 分行、百度按行返回（N 条只占 1 次请求额度），
         // 超过单请求字节上限时 baiduTranslateBatch 内部自动分块（分块间仍走 QPS 间隔）
         const cfg = vscode.workspace.getConfiguration('listenAndWrite');
@@ -635,13 +669,13 @@ export class PracticePanel {
         this.tQueue.push(async () => {
           try {
             const results = await baiduTranslateBatch(
-              pending.map((e) => e.text),
+              baiduTargets.map((e) => e.text),
               appId,
               secret,
               proxy
             );
             results.forEach((t, i) => {
-              if (t && pending[i]) this.favs.setTranslation(pending[i].id, t);
+              if (t && baiduTargets[i]) this.favs.setTranslation(baiduTargets[i].id, t);
             });
             trace('[LT-TRACE] 批量翻译完成: ' + results.length + ' 条');
           } catch (e: any) {
@@ -651,6 +685,25 @@ export class PracticePanel {
             this.pushFavorites(false);
           }
         }).catch(() => { /* 队列链已吞异常 */ });
+        break;
+      }
+
+      case 'favWordLookup': {
+        // 收藏视图：展开短语中的某个单词 → 查离线词典。
+        // 本地查询、零成本、不联网；未命中（found:false）页面显示「未收录」，
+        // 不走百度兜底（Q12 决策：想看完整翻译就把它收藏成单词）
+        const favId = String(msg.favId ?? '');
+        const word = String(msg.word ?? '').trim();
+        if (!word) break;
+        const entry = await this.lookupDict(word);
+        this.webview.postMessage({
+          type: 'favWordInfo',
+          favId,
+          word,
+          found: !!entry,
+          phonetic: entry?.phonetic ?? '',
+          translation: entry?.translation ?? '',
+        });
         break;
       }
 
@@ -1426,6 +1479,10 @@ export class PracticePanel {
     display: inline-block; padding: 1px 7px; margin: 1px 4px 1px 0;
     border: 1px solid var(--border); border-radius: 8px; font-size: 11px;
   }
+  .phonetic { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  /* 短语里的可点词（点击查该词的音标/释义） */
+  .ptok { cursor: pointer; border-bottom: 1px dashed var(--border); }
+  .ptok:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
   .player-err {
     display: none; margin-top: 8px; padding: 8px 10px;
@@ -1761,6 +1818,8 @@ let state = {
   favorites: [],
   // 收藏批次「更新翻译」进行中（按钮防连点）
   favUpdating: false,
+  // 短语点词展开状态：favId → { word, found, phonetic, translation }
+  favExpand: {},
   // 答案面板里当前选中的词 token 序号（连续短语）；favSelFor = 选区归属的句号，
   // 切句后句号对不上自动失效，不用在每个切句入口清理
   favSelFor: -1,
@@ -1858,6 +1917,16 @@ window.addEventListener('message', (e) => {
     if (currentView === 'favorites') renderFavView();
     else if (currentView === 'practice') render();
   }
+  // 短语点词的词典查询回包（宿主本地查，即时返回）
+  if (msg.type === 'favWordInfo') {
+    state.favExpand[msg.favId] = {
+      word: msg.word,
+      found: !!msg.found,
+      phonetic: msg.phonetic || '',
+      translation: msg.translation || '',
+    };
+    if (currentView === 'favorites') renderFavView();
+  }
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
   // ★ 下载来源区分（2026-09-19）：
   //   - 「发现 TED」列表里点「下载」→ 进度/错误只更新那张卡片，页面留在列表
@@ -1917,6 +1986,24 @@ window.addEventListener('message', (e) => {
 /* ---------------- 收藏视图 ---------------- */
 
 /**
+ * 把英文句子/短语渲染成「可点单词 token + 原样分隔符」。
+ * 只把纯英文单词做成 token（撇号/连字符连写算一个词），标点原样输出——
+ * 这样 data-word 干净，词典查询不会带着句号/逗号落空。
+ */
+function renderPtoks(text, favId) {
+  const re = /[A-Za-z]+(?:['’-][A-Za-z]+)*/g;
+  let out = '', last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    out += esc(text.slice(last, m.index));
+    out += '<span class="ptok" data-fav-id="' + esc(favId) + '" data-word="' +
+      esc(m[0]) + '">' + esc(m[0]) + '</span>';
+    last = m.index + m[0].length;
+  }
+  out += esc(text.slice(last));
+  return out;
+}
+
+/**
  * 收藏列表：词条 + 译文 + 来源句。
  * - 未配置百度翻译 → 顶部提示条，pending 条目标 ⏳；
  * - 已配置且有 pending → 显示「更新翻译」按钮（手动触发，QPS=1 串行）；
@@ -1954,32 +2041,65 @@ function renderFavView() {
 
   html += favs.map((f, k) => {
     const ctx = f.context || {};
+    // 释义行：整句不在这里显示（translation 就是原句译文，与下方「译：」重复）；
+    // 单词/短语按 ； 与换行拆成 chip 展示（词典/百度的多义项都适用）
     const trans = f.pending
       ? '<span class="hint">⏳ 待翻译' +
         (state.baiduConfigured ? '（点上方「更新翻译」补全）' : '（未配置百度翻译 API）') +
         '</span>'
       : f.type === 'sentence'
-        ? esc(f.translation).replace(/\\n/g, '<br>')
-        : // 百度把一个词的多义项合并在一个字符串里（「书；账簿；预订」），
-          // 按 ；/; 拆成 chip 展示，视觉上就是多个义项
-          esc(f.translation)
-            .split(/[；;]/)
+        ? ''
+        : esc(f.translation)
+            .split(/[；;\\n]/)
             .map((x) => x.trim())
             .filter((x) => x)
             .map((x) => '<span class="chip">' + x + '</span>')
             .join('');
     const canJump = !!ctx.dirName && typeof ctx.sentenceIndex === 'number';
     const typeLabel = f.type === 'word' ? '单词' : (f.type === 'phrase' ? '短语' : '整句');
+
+    // 标题区：单词带音标（离线词典）；短语/整句渲染成可点 token（点词展开音标/释义）
+    let title = esc(f.text);
+    if (f.type === 'word' && !f.pending && f.phonetic) {
+      const ph = String(f.phonetic);
+      title += '<span class="phonetic">' +
+        (ph.indexOf('/') >= 0 ? esc(ph) : '/' + esc(ph) + '/') + '</span>';
+    } else if ((f.type === 'phrase' || f.type === 'sentence') && !f.pending) {
+      title = renderPtoks(f.text, f.id);
+    }
+
+    // 短语点词的展开行（favWordInfo 回填）
+    const expand = state.favExpand[f.id];
+    const expandHtml = expand
+      ? '<div class="meta">' +
+        (expand.found
+          ? '<span class="phonetic">' + esc(expand.word) +
+            (expand.phonetic ? '  /' + esc(expand.phonetic) + '/' : '') + '</span> ' +
+            esc(expand.translation)
+              .split(/[；;\\n]/)
+              .map((x) => x.trim())
+              .filter((x) => x)
+              .map((x) => '<span class="chip">' + x + '</span>')
+              .join('')
+          : '<span class="hint">「' + esc(expand.word) + '」本地词典未收录</span>') +
+        '</div>'
+      : '';
+
     return '<div class="lib-card" data-k="' + k + '"' + (canJump ? '' : ' style="cursor:default"') + '>' +
-      '<div class="t">' + esc(f.text) +
+      '<div class="t">' + title +
         '<span class="badge">' + typeLabel + '</span>' +
         '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
           'style="float:right;padding:0 6px" title="删除">✕</button>' +
       '</div>' +
-      '<div class="meta">' + trans + '</div>' +
-      '<div class="meta">「' + esc(ctx.sentenceText || '') + '」' +
-        (ctx.sentenceTranslation ? '<br>译：' + esc(ctx.sentenceTranslation) : '') + '</div>' +
-      '<div class="meta hint">' + esc(ctx.talkTitle || '(未知课程)') +
+      (trans ? '<div class="meta">' + trans + '</div>' : '') + expandHtml +
+      // 整句：标题本身就是原句，不再重复引述，只显示「译：」（与单词/短语一致）
+      '<div class="meta">' +
+        (f.type === 'sentence'
+          ? (ctx.sentenceTranslation ? '译：' + esc(ctx.sentenceTranslation) : '')
+          : (ctx.sentenceText ? '例句：' + esc(ctx.sentenceText) : '') +
+            (ctx.sentenceTranslation ? '<br>译：' + esc(ctx.sentenceTranslation) : '')) +
+      '</div>' +
+      '<div class="meta hint">来源：' + esc(ctx.talkTitle || '(未知课程)') +
         ' · 句 ' + (Number(ctx.sentenceIndex) + 1) +
         (canJump ? ' · 点击跳回原句' : '') + '</div>' +
     '</div>';
@@ -1989,6 +2109,22 @@ function renderFavView() {
 
   const retry = document.getElementById('favRetry');
   if (retry) retry.onclick = () => vscode.postMessage({ type: 'favRetry' });
+  // 短语/整句点词：查离线词典（宿主本地查，零成本），回包后在该卡片就地展开；
+  // 再点同一个 token → 收起（不发请求）
+  favView.querySelectorAll('.ptok').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const favId = el.dataset.favId;
+      const word = el.dataset.word;
+      const cur = state.favExpand[favId];
+      if (cur && cur.word === word) {
+        delete state.favExpand[favId];
+        renderFavView();
+        return;
+      }
+      vscode.postMessage({ type: 'favWordLookup', favId: favId, word: word });
+    };
+  });
   favView.querySelectorAll('.fav-del').forEach((btn) => {
     btn.onclick = (e) => {
       e.stopPropagation();

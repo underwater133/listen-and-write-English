@@ -238,4 +238,14 @@ export class FavoriteStore {
       this.save(items);
     }
   }
+
+  /** 音标来自离线词典（可后补；空串 = 无音标） */
+  setPhonetic(id: string, phonetic: string): void {
+    const items = this.load();
+    const it = items.find((x) => x.id === id);
+    if (it) {
+      (it as any).phonetic = phonetic;
+      this.save(items);
+    }
+  }
 }

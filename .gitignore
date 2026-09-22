@@ -22,3 +22,6 @@ Thumbs.db
 
 # 扩展打包产物
 *.vsix
+
+# 词典构建临时数据（ECDICT 仓库 zip / 解压产物；生成的 assets/dict.json.gz 要提交）
+build/
