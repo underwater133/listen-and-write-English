@@ -597,9 +597,11 @@ check(
 );
 check(
   'panel.ts: 收藏视图跳回原句（openCached 带 sentenceIndex，pushMaterial 带 jumpTo）',
-  /jumpTo: this\.pendingJumpTo/.test(panel) && /sentenceIndex: f\.context\.sentenceIndex/.test(panel) &&
+  /jumpTo: this\.pendingJumpTo/.test(panel) &&
+    /dirName: f\.dirName/.test(panel) &&
+    /sourceUrl: this\.material\.sourceUrl \|\| ''/.test(panel) &&
     /state\.currentIndex =\s*\n?\s*Number\.isFinite\(jt\)/.test(panel),
-  '跳回原句的链路没接通，点击收藏卡片只会打开素材第一句'
+  '跳回原句的链路没接通（含 sourceUrl 下发与 dirName 动态解析），点击收藏卡片只会打开素材第一句'
 );
 
 /* ---------- 离线词典（ECDICT 子集） ---------- */

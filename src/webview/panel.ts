@@ -309,9 +309,23 @@ export class PracticePanel {
 
   /** 把收藏列表（+配置状态+批次进度）推给页面 */
   private pushFavorites(updating?: boolean): void {
+    // 跳回原句需要 dirName（素材目录名）。在推送时动态解析，而不是只在收藏
+    // 时写死 —— 素材目录迁移/改名后仍能对上。解析顺序：
+    //   已存的 dirName → slug 对齐（新数据有 sourceUrl）→ 课程标题对齐（旧数据兜底）
+    const cached = this.scanCached().filter((i) => i.hasAudio);
+    const favorites = this.favs.list().map((e) => {
+      const ctx = e.context || ({} as any);
+      const slug = slugFromUrl(ctx.sourceUrl || '');
+      let dirName = ctx.dirName || cached.find((c) => c.slug === slug)?.dirName || '';
+      if (!dirName && ctx.talkTitle) {
+        const t = String(ctx.talkTitle);
+        dirName = cached.find((c) => c.title === t)?.dirName || '';
+      }
+      return { ...e, dirName };
+    });
     this.webview.postMessage({
       type: 'favList',
-      favorites: this.favs.list(),
+      favorites,
       baiduConfigured: this.isBaiduConfigured(),
       updating: !!updating,
     });
@@ -1239,6 +1253,8 @@ export class PracticePanel {
         id: this.material.id,
         title: this.material.title,
         presenter: this.material.presenter,
+        // 收藏「跳回原句」靠它解析 slug → 素材目录；缺失会让 dirName 永远为空
+        sourceUrl: this.material.sourceUrl || '',
         sentences: sentences,
         // 已有修正的句数：页面据此决定要不要显示「复原全部」
         timingCount: timingCount,
@@ -1483,6 +1499,9 @@ export class PracticePanel {
   /* 短语里的可点词（点击查该词的音标/释义） */
   .ptok { cursor: pointer; border-bottom: 1px dashed var(--border); }
   .ptok:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  /* 收藏卡片「来源」行：可跳回原句的入口（仅在有对应素材时可点） */
+  .jump-link { text-decoration: underline; cursor: pointer; }
+  .jump-link:hover { color: var(--accent); }
 
   .player-err {
     display: none; margin-top: 8px; padding: 8px 10px;
@@ -2055,8 +2074,11 @@ function renderFavView() {
             .filter((x) => x)
             .map((x) => '<span class="chip">' + x + '</span>')
             .join('');
-    const canJump = !!ctx.dirName && typeof ctx.sentenceIndex === 'number';
+    // 跳回原句的 dirName 由宿主在 favList 里动态解析（含旧数据标题兜底）
+    const canJump = !!f.dirName && typeof ctx.sentenceIndex === 'number';
     const typeLabel = f.type === 'word' ? '单词' : (f.type === 'phrase' ? '短语' : '整句');
+    const sourceText = '来源：' + esc(ctx.talkTitle || '(未知课程)') +
+      ' · 句 ' + (Number(ctx.sentenceIndex) + 1);
 
     // 标题区：单词带音标（离线词典）；短语/整句渲染成可点 token（点词展开音标/释义）
     let title = esc(f.text);
@@ -2085,7 +2107,7 @@ function renderFavView() {
         '</div>'
       : '';
 
-    return '<div class="lib-card" data-k="' + k + '"' + (canJump ? '' : ' style="cursor:default"') + '>' +
+    return '<div class="lib-card" data-k="' + k + '">' +
       '<div class="t">' + title +
         '<span class="badge">' + typeLabel + '</span>' +
         '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
@@ -2099,9 +2121,12 @@ function renderFavView() {
           : (ctx.sentenceText ? '例句：' + esc(ctx.sentenceText) : '') +
             (ctx.sentenceTranslation ? '<br>译：' + esc(ctx.sentenceTranslation) : '')) +
       '</div>' +
-      '<div class="meta hint">来源：' + esc(ctx.talkTitle || '(未知课程)') +
-        ' · 句 ' + (Number(ctx.sentenceIndex) + 1) +
-        (canJump ? ' · 点击跳回原句' : '') + '</div>' +
+      // 跳转入口 = 来源行本身（下划线可点）；整卡不响应点击
+      '<div class="meta hint">' +
+        (canJump
+          ? '<span class="jump-link" data-jump-k="' + k + '">' + sourceText + '</span>'
+          : sourceText) +
+      '</div>' +
     '</div>';
   }).join('');
 
@@ -2131,14 +2156,20 @@ function renderFavView() {
       vscode.postMessage({ type: 'favRemove', id: btn.dataset.id });
     };
   });
-  favView.querySelectorAll('.lib-card').forEach((card) => {
-    card.onclick = () => {
-      const f = state.favorites[Number(card.dataset.k)];
-      if (!f || !f.context || !f.context.dirName) return;
+  // 来源行 = 跳转入口：跳过去后自动进入「看答案」状态并展开字幕列表
+  favView.querySelectorAll('.jump-link').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      const f = state.favorites[Number(el.dataset.jumpK)];
+      if (!f || !f.dirName) return;
+      state.listCollapsed = false;
+      state.revealAnswer = true;
+      state.favSel = [];
+      state.favSelFor = -1;
       vscode.postMessage({
         type: 'openCached',
-        dirName: f.context.dirName,
-        sentenceIndex: f.context.sentenceIndex,
+        dirName: f.dirName,
+        sentenceIndex: f.context?.sentenceIndex ?? 0,
       });
       showPracticeView();
     };
