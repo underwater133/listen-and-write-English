@@ -533,7 +533,7 @@ check(
 check(
   'panel.ts: 连播切句不丢输入框焦点（重建前记住，重建后原样恢复）',
   /hadInputFocus/.test(panel) &&
-    /if \(hadInputFocus \|\| state\.playMode !== 'auto'\) ta\.focus\(\);/.test(panel) &&
+    /if \(hadInputFocus\) ta\.focus\(\);/.test(panel) &&
     /setSelectionRange\(prevSel\[0\], prevSel\[1\]\)/.test(panel),
   '连播切句会整体重建 DOM，不恢复焦点的话用户点进输入框的焦点每句都会丢'
 );
@@ -638,6 +638,21 @@ check(
   fs.existsSync(path.join(__dirname, '../../scripts/build-dict.mjs')) &&
     fs.existsSync(path.join(__dirname, '../../assets/dict.json.gz')),
   '词典数据或构建脚本缺失，离线查词会全部走百度'
+);
+check(
+  'panel.ts: 精听快捷键 a/d/空格/w/s（与按钮共用动作函数，输入框聚焦时不抢键）',
+  /function (gotoPrev|gotoNext|togglePlayPause|cyclePlayMode|cycleRate)/.test(panel) &&
+    /document\.addEventListener\('keydown'/.test(panel) &&
+    /case ' ': e\.preventDefault\(\); togglePlayPause\(\); break;/.test(panel) &&
+    /ae\.tagName === 'TEXTAREA' \|\| ae\.tagName === 'INPUT'/.test(panel),
+  '快捷键没接上，或输入框聚焦时被抢键'
+);
+check(
+  'panel.ts: 输入框不自动聚焦（避免吞掉快捷键）',
+  !/ta\.focus\(\);\s*\n?\s*\} catch/.test(panel) === true &&
+    !/state\.pendingFocusInput/.test(panel) &&
+    /if \(hadInputFocus\) ta\.focus\(\);/.test(panel),
+  '切句后自动聚焦输入框会把 a/d/空格 快捷键吞进输入框'
 );
 check(
   'panel.ts: 收藏整句二态切换，且有选区时隐藏收藏整句',

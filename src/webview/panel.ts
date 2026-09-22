@@ -2289,6 +2289,78 @@ navBtn.favorites.onclick = () => {
   vscode.postMessage({ type: 'favListRequest' });
 };
 
+/* ---------------- 精听界面快捷键与播放动作 ----------------
+ * 按钮与快捷键共用同一套动作函数，行为永远一致。
+ * 快捷键：a 上一句 / d 下一句 / 空格 播放·暂停 / w 切播放模式 / s 切倍速
+ * 守卫条件（按顺序）：
+ *   - 只在精听界面生效
+ *   - 带修饰键的组合键不碰（留给 VS Code / 浏览器）
+ *   - 输入框/文本域聚焦时不抢键 —— 用户正在打听写内容，a/d/s/w/空格属于输入
+ */
+function gotoPrev() {
+  const m = state.material;
+  if (!m || state.currentIndex <= 0) return;
+  state.currentIndex -= 1;
+  render();
+  playCurrent();
+}
+
+function gotoNext() {
+  const m = state.material;
+  if (!m || state.currentIndex >= m.sentences.length - 1) return;
+  state.currentIndex += 1;
+  render();
+  playCurrent();
+}
+
+function togglePlayPause() {
+  if (!player.paused) { player.pause(); return; }
+  const m = state.material;
+  const s = m && m.sentences[state.currentIndex];
+  const ms = player.currentTime * 1000;
+  // 暂停点仍在当前句区间内 → 原地恢复（不重新 seek）；否则从句首播
+  if (player.currentSrc && s && ms > s.startMs && ms < s.endMs) {
+    player.play().catch(() => {});
+  } else {
+    playCurrent();
+  }
+}
+
+function cyclePlayMode() {
+  state.playMode =
+    PLAY_MODE_ORDER[(PLAY_MODE_ORDER.indexOf(state.playMode) + 1) % PLAY_MODE_ORDER.length];
+  render();
+  // 模式切换立即生效：正在播的句子按新模式重新布防看门狗
+  if (!player.paused) {
+    const s = state.material && state.material.sentences[state.currentIndex];
+    if (s) armStopTimer(s.startMs / 1000, s.endMs / 1000);
+  }
+}
+
+function cycleRate() {
+  const rates = [1, 0.75, 0.5, 1.25];
+  state.rate = rates[(rates.indexOf(state.rate) + 1) % rates.length];
+  player.playbackRate = state.rate;
+  render();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (currentView !== 'practice') return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) {
+    return; // 正在输入，按键属于输入框
+  }
+  if (!state.material) return;
+  switch (e.key) {
+    case 'a': gotoPrev(); break;
+    case 'd': gotoNext(); break;
+    case ' ': e.preventDefault(); togglePlayPause(); break;
+    case 'w': cyclePlayMode(); break;
+    case 's': cycleRate(); break;
+  }
+});
+
 function discLoad(page) {
   if (discState.loading) return;
   discState.loading = true;
@@ -3106,36 +3178,16 @@ function renderPractice() {
 
   // 播放按钮二态（连播/循环模式下也能随时暂停）：
   // 播放中 → 暂停；暂停且播放位置仍在当前句区间内 → 原地恢复（不重新 seek）；
+  // 播放控制按钮：与快捷键共用同一套动作函数（行为一致，改一处两边生效）
+  // play 二态逻辑见 togglePlayPause：播放中 → 暂停；
+  // 暂停且播放位置仍在当前句区间内 → 原地恢复（不重新 seek）；
   // 否则（停着/已播到句尾）→ 从句首播
-  document.getElementById('play').onclick = () => {
-    if (!player.paused) { player.pause(); return; }
-    const s = m && m.sentences[i];
-    const ms = player.currentTime * 1000;
-    if (player.currentSrc && s && ms > s.startMs && ms < s.endMs) {
-      player.play().catch(() => {});
-    } else {
-      playCurrent();
-    }
-  };
+  document.getElementById('play').onclick = togglePlayPause;
   document.getElementById('replay').onclick = playCurrent;
-  document.getElementById('prev').onclick = () => { if (i > 0) { state.currentIndex = i - 1; render(); playCurrent(); } };
-  document.getElementById('next').onclick = () => { if (i < m.sentences.length - 1) { state.currentIndex = i + 1; render(); playCurrent(); } };
-  document.getElementById('rate').onclick = () => {
-    const rates = [1, 0.75, 0.5, 1.25];
-    state.rate = rates[(rates.indexOf(state.rate) + 1) % rates.length];
-    player.playbackRate = state.rate;
-    render();
-  };
-  document.getElementById('loop').onclick = () => {
-    state.playMode =
-      PLAY_MODE_ORDER[(PLAY_MODE_ORDER.indexOf(state.playMode) + 1) % PLAY_MODE_ORDER.length];
-    render();
-    // 模式切换立即生效：正在播的句子按新模式重新布防看门狗
-    if (!player.paused) {
-      const s = state.material && state.material.sentences[state.currentIndex];
-      if (s) armStopTimer(s.startMs / 1000, s.endMs / 1000);
-    }
-  };
+  document.getElementById('prev').onclick = gotoPrev;
+  document.getElementById('next').onclick = gotoNext;
+  document.getElementById('rate').onclick = cycleRate;
+  document.getElementById('loop').onclick = cyclePlayMode;
   // 看答案：显隐走 state（切句/倍速/切模式后依然保持），内容跟随当前句
   document.getElementById('reveal').onclick = () => {
     state.revealAnswer = !state.revealAnswer;
@@ -3219,9 +3271,10 @@ function renderPractice() {
   }
 
   const ta = document.getElementById('input');
-  // 非连播模式（听写）主动聚焦输入框；连播模式不抢焦点，
-  // 但重建前输入框已有焦点（用户自己点进去的）则原样恢复
-  if (hadInputFocus || state.playMode !== 'auto') ta.focus();
+  // 聚焦策略：不自动聚焦（避免吞掉快捷键 a/d/空格/w/s）。
+  // 唯一例外：输入框本来就有焦点（用户自己点进去打字），重建后原样恢复，
+  // 否则切句重渲染会把用户的手动焦点悄悄丢掉。
+  if (hadInputFocus) ta.focus();
   // 内容没变（同句重渲染）才恢复光标位置；切句后是新内容，恢复旧偏移无意义
   if (prevSel && prevValue !== null && ta.value === prevValue) {
     ta.setSelectionRange(prevSel[0], prevSel[1]);
