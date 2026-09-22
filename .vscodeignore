@@ -7,3 +7,5 @@ aac-route-test.html
 .vscode/**
 .gitignore
 out/test/**
+build/**
+scripts/**
