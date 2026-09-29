@@ -302,27 +302,43 @@ export class PracticePanel {
     return !!cfg.get<string>('baiduAppId', '').trim() && !!cfg.get<string>('baiduSecret', '').trim();
   }
 
+  /**
+   * 把收藏条目解析到素材目录名。解析顺序：
+   *   slug（新数据有 sourceUrl，权威）→ 收藏时写死的 dirName → 课程标题兜底（旧数据）。
+   * 命中后必须校验「句号落在该素材句数范围内」—— 对不上就视为解析失败。
+   * 宁可不播也不播错误素材（2026-09-29 反馈「播放的不是对应素材」的根源就是
+   * 标题兜底匹配到了同名/相近素材，句号越界又被静默钳到最后一句）。
+   */
+  private resolveFavDir(ctx: any): string {
+    const idx = Number(ctx.sentenceIndex) || 0;
+    const slug = slugFromUrl(ctx.sourceUrl || '');
+    const cached = this.scanCached().filter((i) => i.hasAudio);
+    const fits = (c: CachedMaterial) => c.sentenceCount > idx;
+    const bySlug = slug ? cached.find((c) => c.slug === slug) : undefined;
+    if (bySlug && fits(bySlug)) return bySlug.dirName;
+    if (ctx.dirName) {
+      const byStored = cached.find((c) => c.dirName === ctx.dirName);
+      if (byStored && fits(byStored)) return byStored.dirName;
+    }
+    if (ctx.talkTitle) {
+      const t = String(ctx.talkTitle);
+      const byTitle = cached.find((c) => c.title === t && fits(c));
+      if (byTitle) return byTitle.dirName;
+    }
+    return '';
+  }
+
   /** 离线词典查询（单例共享）。未命中/词典不可用返回 null，调用方走百度兜底 */
   private async lookupDict(word: string): Promise<{ phonetic: string; translation: string } | null> {
     return getDictionary(this.deps.dictPath).lookup(word);
   }
 
-  /** 把收藏列表（+配置状态+批次进度）推给页面 */
+  /** 把收藏列表（+配置状态+批次进度）推给页面。dirName 动态解析，见 resolveFavDir */
   private pushFavorites(updating?: boolean): void {
-    // 跳回原句需要 dirName（素材目录名）。在推送时动态解析，而不是只在收藏
-    // 时写死 —— 素材目录迁移/改名后仍能对上。解析顺序：
-    //   已存的 dirName → slug 对齐（新数据有 sourceUrl）→ 课程标题对齐（旧数据兜底）
-    const cached = this.scanCached().filter((i) => i.hasAudio);
-    const favorites = this.favs.list().map((e) => {
-      const ctx = e.context || ({} as any);
-      const slug = slugFromUrl(ctx.sourceUrl || '');
-      let dirName = ctx.dirName || cached.find((c) => c.slug === slug)?.dirName || '';
-      if (!dirName && ctx.talkTitle) {
-        const t = String(ctx.talkTitle);
-        dirName = cached.find((c) => c.title === t)?.dirName || '';
-      }
-      return { ...e, dirName };
-    });
+    const favorites = this.favs.list().map((e) => ({
+      ...e,
+      dirName: this.resolveFavDir(e.context || {}),
+    }));
     this.webview.postMessage({
       type: 'favList',
       favorites,
@@ -721,6 +737,73 @@ export class PracticePanel {
         break;
       }
 
+      case 'favPlayExample': {
+        // 收藏视图「例句」🔊：按收藏条目定位素材目录，应用时间轴修正层后取该句
+        // start/end，把音频以 asWebviewUri 发给页面播放（CSP 已放行 cspSource）。
+        // dirName 解析顺序与 pushFavorites 一致：slug 对齐 → 课程标题兜底
+        const favId = String(msg.favId ?? '');
+        const entry = this.favs.list().find((x) => x.id === favId);
+        if (!entry) break;
+        const ctx = entry.context || ({} as any);
+        const dir = this.resolveFavDir(ctx);
+        if (!dir) {
+          trace('[LT-TRACE] favPlayExample：dir 解析失败 favId=' + favId);
+          this.webview.postMessage({
+            type: 'notice',
+            message: '该收藏没有对应的本地素材，无法播放例句。',
+          });
+          break;
+        }
+        const dirPath = path.join(this.deps.cacheRoot, dir);
+        trace('[LT-TRACE] favPlayExample：dir=' + dir + ' sentenceIndex=' + ctx.sentenceIndex);
+        try {
+          const m = JSON.parse(
+            fs.readFileSync(path.join(dirPath, 'material.json'), 'utf8')
+          ) as ListeningMaterial;
+          const info = JSON.parse(
+            fs.readFileSync(path.join(dirPath, 'audio.json'), 'utf8')
+          ) as AudioInfo;
+          const idx = Number(ctx.sentenceIndex) || 0;
+          const overrides = readTimingOverrides(dirPath);
+          const clamped = clampSentencesToAudio(
+            applyTimingOverrides(m.sentences, overrides, info.durationMs),
+            info.durationMs
+          );
+          // ⚠️ 句号必须真的落在这个素材的句数范围内：越界说明 dirName 解析
+          //    到了错误的素材。绝不静默钳到最后一句 —— 那会播出完全无关的音频
+          //    （2026-09-29 反馈「播放的不是对应素材」就是这么被钳出来的）
+          if (idx >= clamped.length) {
+            trace('[LT-TRACE] favPlayExample：句号越界 idx=' + idx + '，素材「' +
+              (m.title || dir) + '」共 ' + clamped.length + ' 句 —— dirName 对错了素材');
+            this.webview.postMessage({
+              type: 'notice',
+              message: '例句句号（' + (idx + 1) + '）超出素材「' + (m.title || dir) +
+                '」的句数范围，未播放。',
+            });
+            break;
+          }
+          const s = clamped[idx];
+          const audioPath = relocateAudioPath(dirPath, info) || path.join(dirPath, 'audio.mp3');
+          trace('[LT-TRACE] favExampleAudio 下发：' + audioPath + ' ' + s.startMs + '-' + s.endMs);
+          this.webview.postMessage({
+            type: 'favExampleAudio',
+            favId,
+            url: this.webview.asWebviewUri(vscode.Uri.file(audioPath)).toString(),
+            startMs: s.startMs,
+            endMs: s.endMs,
+            mime: info.format === 'aac' ? 'audio/aac'
+              : (info.format === 'mp3' ? 'audio/mpeg' : 'audio/mp4'),
+          });
+        } catch (e: any) {
+          trace('[LT-TRACE] favPlayExample 异常：' + String(e?.message ?? e));
+          this.webview.postMessage({
+            type: 'notice',
+            message: '例句播放失败：' + String(e?.message ?? e),
+          });
+        }
+        break;
+      }
+
       case 'check': {
         const idx: number = msg.sentenceIndex;
         const input: string = msg.input ?? '';
@@ -797,7 +880,7 @@ export class PracticePanel {
        * 只作为最后一道降级，正常情况仍优先走 asWebviewUri（更省内存）。
        */
       case 'requestAudioBytes': {
-        await this.sendAudioBytes();
+        await this.sendAudioBytes(msg.uri, msg.mime);
         break;
       }
 
@@ -1066,11 +1149,39 @@ export class PracticePanel {
   }
 
   /**
-   * 读取当前素材的音频文件并回传字节。
+   * 读取音频文件并回传字节。
    * 走宿主 fs，不经过 webview 资源协议，因此不受 401 影响。
+   *
+   * @param requestedUri 页面声明的 vscode-resource 音频地址（例句播放可能请求
+   *        非当前素材的文件）。提供时从中解码出 fs 路径 —— 但**必须在
+   *        cacheRoot 之内**（webview 不可信，防任意文件读取），否则回退当前素材。
+   * @param requestedMime 页面声明的期望 MIME，原样回传给页面包 Blob 用。
    */
-  private async sendAudioBytes(): Promise<void> {
-    const audioPath = this.material?.audio?.path;
+  private async sendAudioBytes(requestedUri?: string, requestedMime?: string): Promise<void> {
+    let audioPath = this.material?.audio?.path;
+    let format = this.material?.audio?.format ?? null;
+
+    if (requestedUri) {
+      try {
+        const u = new URL(requestedUri);
+        let p = decodeURIComponent(u.pathname);
+        // vscode-resource 的 pathname 形如 '/d%3A/ListeningMaterials/...'（Windows 盘符前有 /）
+        if (/^\/[a-zA-Z]:\//.test(p)) p = p.slice(1);
+        const resolved = path.normalize(p);
+        const root = path.normalize(this.deps.cacheRoot);
+        if (!resolved.toLowerCase().startsWith(root.toLowerCase() + path.sep)) {
+          trace('[LT-TRACE] sendAudioBytes：拒绝 cacheRoot 之外的路径 ' + resolved);
+          this.webview.postMessage({ type: 'audioBytes', error: 'path-outside-cacheRoot' });
+          return;
+        }
+        audioPath = resolved;
+        const ext = path.extname(resolved).toLowerCase();
+        format = ext === '.mp3' ? 'mp3' : ext === '.aac' ? 'aac' : 'm4a';
+      } catch (e: any) {
+        trace('[LT-TRACE] sendAudioBytes：解析 requestedUri 失败 ' + String(e?.message ?? e));
+      }
+    }
+
     if (!audioPath) {
       this.webview.postMessage({ type: 'audioBytes', error: 'no-path' });
       return;
@@ -1098,8 +1209,9 @@ export class PracticePanel {
         type: 'audioBytes',
         base64: buf.toString('base64'),
         bytes: buf.byteLength,
-        // 页面据此选 MIME
-        format: this.material?.audio?.format ?? null,
+        // 页面据此选 MIME；requestedMime 优先（与请求声明一致）
+        format: format ?? null,
+        mime: requestedMime || null,
       });
     } catch (e: any) {
       trace('[LT-TRACE] sendAudioBytes 失败: ' + (e?.message ?? e));
@@ -1502,6 +1614,8 @@ export class PracticePanel {
   /* 收藏卡片「来源」行：可跳回原句的入口（仅在有对应素材时可点） */
   .jump-link { text-decoration: underline; cursor: pointer; }
   .jump-link:hover { color: var(--accent); }
+  /* 例句 🔊 小按钮：行内轻量操作，与收藏小按钮同字号 */
+  .ex-play { padding: 0 4px; font-size: 11px; line-height: 1.4; }
 
   .player-err {
     display: none; margin-top: 8px; padding: 8px 10px;
@@ -1767,7 +1881,7 @@ player.addEventListener('error', () => {
   }
   // ★ src 归属检查：error 必须属于「当前生效源」才值得打扰用户。
   //
-  //   ensurePlayerSource 的三条路线都复用同一个 player 元素，
+  //   ensurePlayerSource 的加载路线复用同一个 player 元素，
   //   路线 1/2 的探测失败是【预期内的】——流程内部有自己的 onErr 捕获
   //   并继续尝试下一条路线。但挂在这个元素上的全局监听也会同时收到
   //   error，如果无条件弹 toast，就会出现「页面一打开先闪一下报错、
@@ -1946,6 +2060,39 @@ window.addEventListener('message', (e) => {
     };
     if (currentView === 'favorites') renderFavView();
   }
+  // 例句播放：宿主解析出音频地址与句段起止，复用主 player 播放，到句尾自动停。
+  // ⚠️ 必须走 ensurePlayerSource（宿主字节路线，MIME 随请求声明）：
+  //    直链会踩 MEDIA_ERR_SRC_NOT_SUPPORTED（asWebviewUri 不保证 Content-Type）
+  if (msg.type === 'favExampleAudio') {
+    stopExamplePlayback();
+    if (player._stopTimer) { clearInterval(player._stopTimer); player._stopTimer = null; }
+    const startSec = msg.startMs / 1000;
+    const endSec = msg.endMs / 1000;
+    ensurePlayerSource(msg.url, msg.mime).then((src) => {
+      if (!src) { showNotice('例句加载失败（宿主字节路线不可用）'); return; }
+      const seekAndPlay = () => {
+        let target = startSec;
+        try {
+          const sk = player.seekable;
+          if (sk && sk.length > 0) {
+            if (target < sk.start(0)) target = sk.start(0);
+            if (target > sk.end(0)) target = sk.end(0);
+          }
+          player.currentTime = target;
+        } catch (err) { /* 未就绪则忽略 */ }
+        pageLog('[LT-PAGE] 例句 seek 到 ' + player.currentTime + 's，开始播放');
+        player.play().catch((e) => showNotice('例句播放失败：' + String(e?.message ?? e)));
+      };
+      if (player.readyState >= 1) seekAndPlay();
+      else player.addEventListener('loadedmetadata', seekAndPlay, { once: true });
+      exampleTimer = setInterval(() => {
+        if (player.paused || player.ended || player.currentTime >= endSec) {
+          stopExamplePlayback();
+          if (!player.paused) player.pause();
+        }
+      }, 100);
+    });
+  }
   if (msg.type === 'checkResult') { state.results[msg.result.sentenceIndex] = msg.result; render(); }
   // ★ 下载来源区分（2026-09-19）：
   //   - 「发现 TED」列表里点「下载」→ 进度/错误只更新那张卡片，页面留在列表
@@ -2003,6 +2150,18 @@ window.addEventListener('message', (e) => {
 });
 
 /* ---------------- 收藏视图 ---------------- */
+
+/* ---- 例句播放：复用主 player（项目规则禁止新建独立 Audio 对象，避免媒体并发饿死）----
+ * favExampleAudio 回包 → 换 src + seek + play → 100ms 轮询到句尾自动停。
+ * 不需要"还原"主播放器状态：回练习界面点播放时 playCurrent 会重新 seek。 */
+let exampleTimer = null;
+
+function stopExamplePlayback() {
+  if (exampleTimer) {
+    clearInterval(exampleTimer);
+    exampleTimer = null;
+  }
+}
 
 /**
  * 把英文句子/短语渲染成「可点单词 token + 原样分隔符」。
@@ -2079,6 +2238,10 @@ function renderFavView() {
     const typeLabel = f.type === 'word' ? '单词' : (f.type === 'phrase' ? '短语' : '整句');
     const sourceText = '来源：' + esc(ctx.talkTitle || '(未知课程)') +
       ' · 句 ' + (Number(ctx.sentenceIndex) + 1);
+    // 例句播放入口（🔊）：有对应本地素材才显示
+    const exPlayBtn = canJump
+      ? '<button class="ex-play" data-fav-id="' + esc(f.id) + '" title="播放例句">🔊</button> '
+      : '';
 
     // 标题区：单词带音标（离线词典）；短语/整句渲染成可点 token（点词展开音标/释义）
     let title = esc(f.text);
@@ -2115,7 +2278,7 @@ function renderFavView() {
       '</div>' +
       (trans ? '<div class="meta">' + trans + '</div>' : '') + expandHtml +
       // 整句：标题本身就是原句，不再重复引述，只显示「译：」（与单词/短语一致）
-      '<div class="meta">' +
+      '<div class="meta">' + (canJump ? exPlayBtn : '') +
         (f.type === 'sentence'
           ? (ctx.sentenceTranslation ? '译：' + esc(ctx.sentenceTranslation) : '')
           : (ctx.sentenceText ? '例句：' + esc(ctx.sentenceText) : '') +
@@ -2148,6 +2311,14 @@ function renderFavView() {
         return;
       }
       vscode.postMessage({ type: 'favWordLookup', favId: favId, word: word });
+    };
+  });
+  // 例句 🔊：请宿主解析该句对应音频段，回包后页面用独立 Audio 播放
+  favView.querySelectorAll('.ex-play').forEach((el) => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      pageLog('[LT-PAGE] 🔊 点击例句播放，favId =', el.dataset.favId);
+      vscode.postMessage({ type: 'favPlayExample', favId: el.dataset.favId });
     };
   });
   favView.querySelectorAll('.fav-del').forEach((btn) => {
@@ -3386,50 +3557,20 @@ function audioMime() {
   return 'audio/mp4';
 }
 
-async function ensurePlayerSource(uri) {
+async function ensurePlayerSource(uri, mimeOverride) {
   if (lastLoadedUrl === uri && activeSrc) return activeSrc;
 
   pageLog('[LT-PAGE] ensurePlayerSource 入参 uri =', uri);
 
-  // 路线 1：直接把这个地址交给 player（asWebviewUri 本身是合法的 webview 资源 URL）
-  const r1 = await loadIntoPlayer(uri);
-  pageLog('[LT-PAGE] 路线1 直链结果 =', r1);
-  if (r1.ok) {
-    activeSrc = uri; lastLoadedUrl = uri;
-    clearPlayerError();
-    return uri;
-  }
-
-  // 路线 2：fetch 成 Blob，显式声明 MIME
-  // （应对 asWebviewUri 未携带正确 Content-Type 的情况）
-  try {
-    const res = await fetch(uri);
-    pageLog('[LT-PAGE] 路线2 fetch status =', res.status, 'ok =', res.ok, 'ct =', res.headers.get('content-type'));
-    if (res.ok) {
-      const ab = await res.arrayBuffer();
-      pageLog('[LT-PAGE] 路线2 读到字节 =', ab.byteLength);
-      const blob = new Blob([ab], { type: audioMime() });
-      const burl = URL.createObjectURL(blob);
-      const r2 = await loadIntoPlayer(burl);
-      pageLog('[LT-PAGE] 路线2 Blob 结果 =', r2);
-      if (r2.ok) {
-        if (activeSrc && activeSrc.startsWith('blob:')) URL.revokeObjectURL(activeSrc);
-        activeSrc = burl; lastLoadedUrl = uri;
-        clearPlayerError();
-        return burl;
-      }
-      URL.revokeObjectURL(burl);
-    }
-  } catch (e) {
-    pageLog('[LT-PAGE] 路线2 异常:', e);
-  }
-
-  // ★ 路线 3（终极兜底）：请扩展宿主直接读文件，把字节传过来。
+  // ★ 唯一加载路线：请扩展宿主直接读文件，把字节传过来。
   //   实测 asWebviewUri 产出的 vscode-cdn.net 地址会被资源服务 401 拒绝
-  //   （fetch 拿到 12 字节 "Unauthorized"，audio 报 code=4）。
+  //   （fetch 拿到 12 字节 "Unauthorized"，audio 报 code=4），
+  //   直链交给 player 则因不保证 Content-Type 报 SRC_NOT_SUPPORTED ——
+  //   原来的「直链 / Blob / 宿主字节」三级降级的前两级恒失败，已移除。
   //   走宿主 fs 完全绕开 webview 的 CDN 权限层。
-  const r3 = await loadViaHostBytes(uri);
-  pageLog('[LT-PAGE] 路线3 宿主字节结果 =', r3);
+  //   uri + mime 一并下传：例句播放可能请求非当前素材的音频文件
+  const r3 = await loadViaHostBytes(uri, mimeOverride || audioMime());
+  pageLog('[LT-PAGE] 宿主字节结果 =', r3);
   if (r3.ok) {
     activeSrc = r3.src; lastLoadedUrl = uri;
     clearPlayerError();
@@ -3445,7 +3586,7 @@ async function ensurePlayerSource(uri) {
  * 这是绕开 webview 资源协议 401 的最后手段。
  * 时序：postMessage 请求 -> 等 audioBytes 回包 -> 建 Blob -> 装进 player。
  */
-function loadViaHostBytes(uri) {
+function loadViaHostBytes(uri, mime) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; cleanup(); resolve(r); } };
@@ -3482,7 +3623,8 @@ function loadViaHostBytes(uri) {
           pageLog('[LT-PAGE] ⚠️ 收到裸 ADTS —— VS Code 内置 ffmpeg 无 ADTS 解复用器，' +
             '必然报 DEMUXER_ERROR_COULD_NOT_OPEN。请清掉旧缓存（cacheVersion < 3）重新下载。');
         }
-        const blob = new Blob([u8], { type: audioMime() });
+        // MIME 优先用请求时声明的（例句可能来自非当前素材），否则按当前素材容器
+        const blob = new Blob([u8], { type: msg.mime || audioMime() });
         pageLog('[LT-PAGE] 路线3 Blob size =', blob.size, '| type =', blob.type);
         const burl = URL.createObjectURL(blob);
         loadIntoPlayer(burl).then((r) => {
@@ -3507,7 +3649,9 @@ function loadViaHostBytes(uri) {
     const timer = setTimeout(() => finish({ ok: false, why: 'host-timeout' }), 20000);
 
     window.addEventListener('message', handler);
-    vscode.postMessage({ type: 'requestAudioBytes' });
+    // 把 uri + 期望 MIME 一起带给宿主：例句播放可能请求非当前素材的音频，
+    // 宿主必须按 uri 读文件、按声明的 MIME 回包（否则会送来错误素材的字节）
+    vscode.postMessage({ type: 'requestAudioBytes', uri: uri, mime: mime });
   });
 }
 
@@ -3592,7 +3736,7 @@ async function playCurrent() {
     // 如果缓存还是旧版（cacheVersion<3），这里直接点明，省去一轮排查。
     const stale = m.audioFormat && m.audioFormat !== 'm4a';
     showPlayerError(
-      '音频无法加载（直链 / Blob / 宿主字节三条路线均失败）。\\n' +
+      '音频无法加载（宿主字节路线失败）。\\n' +
       (stale
         ? '当前容器是「' + m.audioFormat + '」，而 VS Code 内置 ffmpeg 不支持裸 ADTS。\\n' +
           '→ 这是旧版缓存，删除该素材后重新加载即可（v3 起改为 MP4 容器）。\\n'

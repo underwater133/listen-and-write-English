@@ -634,6 +634,16 @@ check(
   '音标/短语点词的展示与交互缺失'
 );
 check(
+  'panel.ts: 例句播放（🔊 → favPlayExample → favExampleAudio → 复用主 player 播片段）',
+  /case 'favPlayExample'/.test(panel) &&
+    /type: 'favExampleAudio'/.test(panel) &&
+    /class="ex-play"/.test(panel) &&
+    /function stopExamplePlayback/.test(panel) &&
+    /player\.currentTime >= endSec/.test(panel) &&
+    !/new Audio\(\)/.test(panel.replace(/\/\/[^\n]*/g, '')),
+  '例句播放链路缺失（通道/按钮/到句尾停止），且必须复用主 player 而非 new Audio()'
+);
+check(
   '构建: 词典构建脚本与产物存在',
   fs.existsSync(path.join(__dirname, '../../scripts/build-dict.mjs')) &&
     fs.existsSync(path.join(__dirname, '../../assets/dict.json.gz')),
