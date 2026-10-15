@@ -1953,6 +1953,11 @@ let state = {
   favUpdating: false,
   // 短语点词展开状态：favId → { word, found, phonetic, translation }
   favExpand: {},
+  // ★ 短语点词重渲染时的滚动锚点：{ favId, cardTop }。renderFavView 整段重建 innerHTML
+  //   会把收藏视图的 scrollTop 冲掉（内容先清空 → scrollTop 被 clamp 归零），表现为
+  //   「点某个单词，那张卡片就跳位」。这里记住被点卡片【重建前】相对视口的位置，
+  //   重建后重新对齐，使该卡片距顶部不变，变化的只有它下面的内容。
+  favScrollAnchor: null,
   // 答案面板里当前选中的词 token 序号（连续短语）；favSelFor = 选区归属的句号，
   // 切句后句号对不上自动失效，不用在每个切句入口清理
   favSelFor: -1,
@@ -2189,6 +2194,9 @@ function renderPtoks(text, favId) {
  */
 function renderFavView() {
   if (!favView) return;
+  // 取出待还原的滚动锚点（消费一次即清空，避免影响其它来源触发的重渲染）
+  const anchor = state.favScrollAnchor;
+  state.favScrollAnchor = null;
   const favs = state.favorites;
   const pendingCount = favs.filter((f) => f.pending).length;
 
@@ -2270,7 +2278,7 @@ function renderFavView() {
         '</div>'
       : '';
 
-    return '<div class="lib-card" data-k="' + k + '">' +
+    return '<div class="lib-card" data-k="' + k + '" data-fav-id="' + esc(f.id) + '">' +
       '<div class="t">' + title +
         '<span class="badge">' + typeLabel + '</span>' +
         '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
@@ -2304,6 +2312,12 @@ function renderFavView() {
       e.stopPropagation();
       const favId = el.dataset.favId;
       const word = el.dataset.word;
+      // ★ 记录这张卡片重建前相对视口的位置：稍后回包触发 renderFavView 整段重建时，
+      //   用它把卡片顶回原位，避免滚动跳位（展开/收起都要记，收起同样会重建）。
+      const card = el.closest('.lib-card');
+      state.favScrollAnchor = card
+        ? { favId: favId, cardTop: card.getBoundingClientRect().top }
+        : null;
       const cur = state.favExpand[favId];
       if (cur && cur.word === word) {
         delete state.favExpand[favId];
@@ -2345,6 +2359,16 @@ function renderFavView() {
       showPracticeView();
     };
   });
+
+  // ★ 还原滚动锚点：innerHTML 重建后，把被点的那张卡片重新对齐到重建前的视口位置，
+  //   于是「卡片距顶部不变，只有下方内容随展开/收起变化」，滚动不再跳位。
+  if (anchor) {
+    const anchorCard = Array.from(favView.querySelectorAll('.lib-card'))
+      .find((c) => c.dataset.favId === anchor.favId);
+    if (anchorCard) {
+      favView.scrollTop += anchorCard.getBoundingClientRect().top - anchor.cardTop;
+    }
+  }
 }
 
 /* ---------------- 「发现 TED」浏览/搜索 ---------------- */

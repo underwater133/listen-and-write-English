@@ -634,6 +634,13 @@ check(
   '音标/短语点词的展示与交互缺失'
 );
 check(
+  'panel.ts: 收藏视图点词/收起不跳位（记录被点卡片 cardTop，重建后按卡片还原滚动）',
+  /state\.favScrollAnchor = card/.test(panel) &&
+    /cardTop: card\.getBoundingClientRect\(\)\.top/.test(panel) &&
+    /favView\.scrollTop \+= anchorCard\.getBoundingClientRect\(\)\.top - anchor\.cardTop/.test(panel),
+  'renderFavView 整段重建会把 scrollTop 归零，必须按被点卡片位置还原，否则卡片跳位'
+);
+check(
   'panel.ts: 例句播放（🔊 → favPlayExample → favExampleAudio → 复用主 player 播片段）',
   /case 'favPlayExample'/.test(panel) &&
     /type: 'favExampleAudio'/.test(panel) &&
