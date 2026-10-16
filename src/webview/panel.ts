@@ -36,6 +36,25 @@ import {
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
 import { getDictionary } from '../core/dictionary';
+import {
+  DAY_MS,
+  DEFAULT_LADDER_TEXT,
+  DEFAULT_MAX_REQUEUE,
+  DEFAULT_NEW_WORDS_PER_DAY,
+  DEFAULT_ROUND_SIZE,
+  ReviewCandidate,
+  ReviewConfig,
+  ReviewGrade,
+  ReviewState,
+  ReviewStore,
+  buildExtra,
+  buildRound0,
+  gradeRequeue,
+  normalizeConfig,
+  reviewKey,
+  schedule,
+  selectPool,
+} from '../core/review';
 import { MistakeStore, trace } from '../extension';
 
 export interface PanelDeps {
@@ -113,6 +132,66 @@ interface LoadContext {
   slug?: string;
 }
 
+/* ---------------- 复习（收藏单词的间隔重复） ---------------- */
+
+/** 下发给页面的一张复习卡片。释义/例句每次都从收藏实时取，不落盘 */
+interface ReviewCardPayload {
+  key: string;
+  favId: string;
+  text: string;
+  phonetic: string;
+  translation: string;
+  pending: boolean;
+  sentenceText: string;
+  sentenceTranslation: string;
+  talkTitle: string;
+  /** 有对应本地素材（能播例句） */
+  canPlay: boolean;
+  level: number;
+  lastAt: number;
+  dueAt: number;
+  reviews: number;
+  isNew: boolean;
+}
+
+/** 本场复习的评分统计 */
+interface ReviewStats {
+  know: number;
+  fuzzy: number;
+  unknown: number;
+}
+
+/**
+ * 一场复习的会话态。
+ *
+ * ⚠️ 只在内存里，不落盘：刷新页面/重开面板就重新组一场。
+ *    进度（level/dueAt）在每次评分时立刻写 ReviewStore，所以中途退出不丢数据。
+ *
+ * 轮次模型：round 0 = 到期卡与新词混合的首轮；轮末把需要重看的卡收进
+ * `nextItems` 作为下一轮；一张卡每场最多额外露面 maxRequeue 次。
+ */
+interface ReviewSession {
+  round: number;
+  /** 当前轮的卡片 key 队列 */
+  items: string[];
+  pos: number;
+  /** 下一轮的队列（轮末确定，等页面点「继续」才生效） */
+  nextItems: string[];
+  /** key → 本场已重排次数（决定还剩多少重排额度） */
+  requeues: Record<string, number>;
+  /** 本场出现过的 key（「再来 5 张」用来排除重复） */
+  seen: Record<string, boolean>;
+  /**
+   * 「已评分待确认」的卡（没看答案就点了不认识/模糊）。
+   * 非 null 时游标【停在原地】，页面显示答案 + 只留一个「下一个」。
+   */
+  heldKey: string | null;
+  /** 全场累计评分 */
+  stats: ReviewStats;
+  /** 本轮评分（过场页显示） */
+  roundStats: ReviewStats;
+}
+
 /**
  * 从 talk 页面 URL 里取 slug（搜索结果里用的也是这个字段）。
  *
@@ -164,6 +243,10 @@ export class PracticePanel {
   private readonly store: MistakeStore;
   /** 收藏（单词/短语/整句）：用户数据，存素材根目录的 favorites.json */
   private readonly favs: FavoriteStore;
+  /** 复习进度：用户数据，存素材根目录的 stats/review.json */
+  private readonly reviews: ReviewStore;
+  /** 当前复习会话（内存态，见 ReviewSession 注释） */
+  private reviewSession: ReviewSession | null = null;
   /** 百度翻译串行队列（标准版 QPS=1，队列内强制间隔） */
   private readonly tQueue = new TranslationQueue();
   /** 手动「更新翻译」批次剩余条数（>0 时 webview 显示进行中） */
@@ -263,6 +346,7 @@ export class PracticePanel {
     // 用户数据（错题/收藏）与素材同根 —— 跟随 materialsDir，卸载重装不丢
     this.store = new MistakeStore(deps.cacheRoot);
     this.favs = new FavoriteStore(deps.cacheRoot);
+    this.reviews = new ReviewStore(deps.cacheRoot);
 
     this.webview.html = this.renderHtml();
 
@@ -339,12 +423,23 @@ export class PracticePanel {
     return getDictionary(this.deps.dictPath).lookup(word);
   }
 
-  /** 把收藏列表（+配置状态+批次进度）推给页面。dirName 动态解析，见 resolveFavDir */
+  /**
+   * 把收藏列表（+配置状态+批次进度+复习状态）推给页面。
+   * dirName 动态解析，见 resolveFavDir。
+   * ⚠️ 复习状态按【词形小写】取（不是收藏 id）—— 与 ReviewStore 的主键一致。
+   */
   private pushFavorites(updating?: boolean): void {
-    const favorites = this.favs.list().map((e) => ({
-      ...e,
-      dirName: this.resolveFavDir(e.context || {}),
-    }));
+    const states = this.reviews.all();
+    const favorites = this.favs.list().map((e) => {
+      const st = e.type === 'word' ? states[reviewKey(e.text)] : undefined;
+      return {
+        ...e,
+        dirName: this.resolveFavDir(e.context || {}),
+        review: st
+          ? { level: st.level, dueAt: st.dueAt, mastered: !!st.mastered }
+          : null,
+      };
+    });
     this.webview.postMessage({
       type: 'favList',
       favorites,
@@ -352,6 +447,232 @@ export class PracticePanel {
       updating: !!updating,
     });
   }
+
+  /* ---------------- 复习 ---------------- */
+
+  /** 复习配置（读 vscode 设置，逐项容错回退默认值） */
+  private reviewConfig(): ReviewConfig {
+    const cfg = vscode.workspace.getConfiguration('listenAndWrite');
+    return normalizeConfig({
+      ladder: cfg.get('reviewLadder', DEFAULT_LADDER_TEXT),
+      newWordsPerDay: cfg.get('reviewNewWordsPerDay', DEFAULT_NEW_WORDS_PER_DAY),
+      roundSize: cfg.get('reviewRoundSize', DEFAULT_ROUND_SIZE),
+      maxRequeue: cfg.get('reviewMaxRequeue', DEFAULT_MAX_REQUEUE),
+    });
+  }
+
+  /** 复习池：从收藏里筛出可复习的单词 */
+  private reviewPool(): ReviewCandidate[] {
+    return selectPool(this.favs.list());
+  }
+
+  /** 24 小时内（含已到期）待复习的词数 —— 结束页/首页显示 */
+  private reviewPendingCount(now: number): number {
+    const states = this.reviews.all();
+    let n = 0;
+    for (const k of Object.keys(states)) {
+      const s = states[k];
+      if (!s.mastered && Number(s.dueAt) <= now + DAY_MS) n++;
+    }
+    return n;
+  }
+
+  /** 复习首页（未开始 / 本场结束后的返回页） */
+  private pushReviewHome(message?: string): void {
+    const now = Date.now();
+    const pool = this.reviewPool();
+    const states = this.reviews.all();
+    const cfg = this.reviewConfig();
+    let due = 0;
+    let mastered = 0;
+    let fresh = 0;
+    for (const c of pool) {
+      const st = states[c.key];
+      if (!st) {
+        fresh++;
+        continue;
+      }
+      if (st.mastered) {
+        mastered++;
+        continue;
+      }
+      if (Number(st.dueAt) <= now) due++;
+    }
+    const used = this.reviews.dailyUsed(now);
+    const newLeft = Math.max(0, Math.min(cfg.newWordsPerDay - used, fresh));
+    this.webview.postMessage({
+      type: 'reviewHome',
+      dueCount: due,
+      newLeft,
+      newTotal: fresh,
+      masteredCount: mastered,
+      totalWords: pool.length,
+      roundSize: cfg.roundSize,
+      pendingCount: this.reviewPendingCount(now),
+      message: message || '',
+    });
+  }
+
+  /** 把一条复习候选组装成下发给页面的卡片 */
+  private buildReviewCard(
+    c: ReviewCandidate,
+    fav: FavoriteEntry,
+    state: ReviewState | undefined
+  ): ReviewCardPayload {
+    const ctx: any = fav.context || {};
+    return {
+      key: c.key,
+      favId: fav.id,
+      text: fav.text,
+      // ⚠️ phonetic 不在 FavoriteEntry 的类型里（由 setPhonetic 以 any 写入），
+      //    这里也按 any 读，拿不到就当没有音标
+      phonetic: String((fav as any).phonetic ?? ''),
+      translation: String(fav.translation ?? ''),
+      pending: !!fav.pending,
+      sentenceText: String(ctx.sentenceText ?? ''),
+      sentenceTranslation: String(ctx.sentenceTranslation ?? ''),
+      talkTitle: String(ctx.talkTitle ?? ''),
+      canPlay: !!this.resolveFavDir(ctx),
+      // ⚠️ 档位显示要按【当前】阶梯长度夹一下：用户改过阶梯长度（或升级前留下的
+      //    旧数据）时，存档 level 可能越界，不夹会显示出「第 7 档」这种不存在的档位。
+      //    只影响显示 —— schedule 读的是存档里的原值，不受这里影响。
+      level: Math.min(state?.level ?? 0, this.reviewConfig().ladder.length - 1),
+      lastAt: state?.lastAt ?? 0,
+      dueAt: state?.dueAt ?? 0,
+      reviews: state?.reviews ?? 0,
+      isNew: !state,
+    };
+  }
+
+  /** 收藏里可复习的单词：key → FavoriteEntry（推一张卡就要用它取释义/例句） */
+  private wordFavByKey(): Map<string, FavoriteEntry> {
+    const m = new Map<string, FavoriteEntry>();
+    for (const f of this.favs.list()) {
+      if (f.type === 'word') m.set(reviewKey(f.text), f);
+    }
+    return m;
+  }
+
+  /**
+   * 推当前游标处的卡片。
+   *
+   * held = true 表示这张卡【已经评过分】、只是还没往下走 —— 页面据此自动翻面、
+   * 收掉三个自评按钮，只留一个「下一个/完成」。
+   * 触发场景：没看答案就点了「不认识/模糊」。用户是蒙的或者根本没想起来，
+   * 直接翻页等于白考一次，得让他先看一眼答案再继续。
+   */
+  private postReviewCard(s: ReviewSession, favByKey: Map<string, FavoriteEntry>, held: boolean): void {
+    const key = s.items[s.pos];
+    const fav = favByKey.get(key) as FavoriteEntry;
+    const cand: ReviewCandidate = {
+      key,
+      favId: fav.id,
+      text: fav.text,
+      createdAt: Number(fav.createdAt) || 0,
+    };
+    s.seen[key] = true;
+    this.webview.postMessage({
+      type: 'reviewCard',
+      card: this.buildReviewCard(cand, fav, this.reviews.get(key)),
+      round: s.round,
+      index: s.pos,
+      total: s.items.length,
+      stats: { ...s.stats },
+      held,
+    });
+  }
+
+  /**
+   * 推进到下一张卡；当前轮走完则做轮末判定。
+   *
+   * 轮末：`nextItems` 非空 → 下发过场页，等页面点「继续」；
+   *       为空 → 本场结束。
+   * ⚠️ 队列里的卡可能因为用户在中途删了收藏而消失 → 这里跳过（不给空白卡片）。
+   */
+  private advanceReview(): void {
+    const s = this.reviewSession;
+    if (!s) return;
+    // 走到这儿一律意味着「停留态结束」
+    s.heldKey = null;
+    const favByKey = this.wordFavByKey();
+    while (s.pos < s.items.length && !favByKey.has(s.items[s.pos])) s.pos++;
+
+    if (s.pos < s.items.length) {
+      this.postReviewCard(s, favByKey, false);
+      return;
+    }
+
+    // ---- 轮末 ----
+    if (s.nextItems.length) {
+      for (const k of s.nextItems) s.requeues[k] = (s.requeues[k] || 0) + 1;
+      this.webview.postMessage({
+        type: 'reviewRoundEnd',
+        finishedRound: s.round + 1,
+        stats: { ...s.roundStats },
+        nextCount: s.nextItems.length,
+      });
+      return;
+    }
+
+    const now = Date.now();
+    this.webview.postMessage({
+      type: 'reviewEnd',
+      stats: { ...s.stats },
+      pendingCount: this.reviewPendingCount(now),
+    });
+    this.reviewSession = null;
+  }
+
+  /**
+   * 重推当前卡：停留在原地就还原「已评分待确认」的形态，否则正常推进。
+   *
+   * 用于会发生重渲染的入口（切回复习视图、补译完成后刷新卡片）——
+   * 这些入口如果直接调 advanceReview()，会把用户正在看的答案顶掉、白丢一次停留。
+   */
+  private repushReviewCard(): void {
+    const s = this.reviewSession;
+    if (!s) return;
+    if (!s.heldKey) {
+      this.advanceReview();
+      return;
+    }
+    const favByKey = this.wordFavByKey();
+    if (s.items[s.pos] !== s.heldKey || !favByKey.has(s.heldKey)) {
+      // 停留的那张卡已经不在了（收藏被删）→ 正常推进
+      this.advanceReview();
+      return;
+    }
+    this.postReviewCard(s, favByKey, true);
+  }
+
+  /** 开一场复习（首轮：新词 + 到期卡打散） */
+  private startReviewSession(): void {
+    const now = Date.now();
+    const pool = this.reviewPool();
+    if (!pool.length) {
+      this.pushReviewHome('收藏里还没有可复习的单词。先到「收藏」收藏几个单词吧。');
+      return;
+    }
+    const cfg = this.reviewConfig();
+    const r0 = buildRound0(pool, this.reviews.all(), cfg, now, this.reviews.dailyUsed(now));
+    if (!r0.items.length) {
+      this.pushReviewHome('今日复习已全部完成。');
+      return;
+    }
+    this.reviewSession = {
+      round: 0,
+      items: r0.items.map((c) => c.key),
+      pos: 0,
+      nextItems: [],
+      requeues: {},
+      seen: {},
+      heldKey: null,
+      stats: { know: 0, fuzzy: 0, unknown: 0 },
+      roundStats: { know: 0, fuzzy: 0, unknown: 0 },
+    };
+    this.advanceReview();
+  }
+
 
   /**
    * 把一条收藏排进百度翻译队列（单词/短语用）。
@@ -668,6 +989,136 @@ export class PracticePanel {
         this.pushFavorites();
         break;
 
+      /* ---------------- 复习（收藏单词的间隔重复） ---------------- */
+
+      case 'reviewListRequest':
+        // 进入复习视图：有进行中的场次就续上（含「已评分待确认」的停留态），否则给首页
+        if (this.reviewSession) this.repushReviewCard();
+        else this.pushReviewHome();
+        break;
+
+      case 'reviewStart':
+        this.startReviewSession();
+        break;
+
+      case 'reviewGrade': {
+        const s = this.reviewSession;
+        const key = reviewKey(String(msg.key ?? ''));
+        const grade = String(msg.grade ?? '') as ReviewGrade;
+        if (!s || !key) break;
+        if (grade !== 'know' && grade !== 'fuzzy' && grade !== 'unknown') break;
+        // ⚠️ 只接受「当前这张卡」的评分：页面连点/消息乱序会让游标与卡片错位，
+        //    一旦错位就会把评分写到别的词头上，这里必须自己再防一次。
+        //    丢弃时重推当前卡，让页面从「按钮已禁用」的死状态里恢复。
+        if (s.items[s.pos] !== key) {
+          this.repushReviewCard();
+          break;
+        }
+        const now = Date.now();
+        const cfg = this.reviewConfig();
+        const prev = this.reviews.get(key);
+        // 首次复习 = 引入一个新词，逐张消耗今日额度（中途退出不浪费额度）
+        if (!prev) this.reviews.addDaily(1, now);
+        const requeues = s.requeues[key] || 0;
+        this.reviews.set(key, schedule(prev, grade, requeues, cfg, now));
+        s.stats[grade]++;
+        s.roundStats[grade]++;
+        if (gradeRequeue(grade, requeues, cfg) > 0) s.nextItems.push(key);
+
+        /*
+         * 没看答案就点「不认识 / 模糊」→ 停在原地让用户看一眼答案。
+         *
+         * ⚠️ 这里必须【不推进游标】。用户没看答案就自评「不认识」，说明是真的没想起来，
+         *    立刻翻页等于白考一次；而「认识」不需要停留（他会，没什么可看的）。
+         *    游标不动还有个好处：切走视图再回来能原样恢复这次停留（见 repushReviewCard）。
+         */
+        if (!msg.revealed && grade !== 'know') {
+          s.heldKey = key;
+          this.repushReviewCard();
+          break;
+        }
+        s.pos++;
+        this.advanceReview();
+        break;
+      }
+
+      case 'reviewNext': {
+        // 停留态里的「下一个 / 完成」：这才真正往下走
+        const s = this.reviewSession;
+        if (!s) break;
+        if (!s.heldKey) {
+          this.repushReviewCard();
+          break;
+        }
+        s.heldKey = null;
+        s.pos++;
+        this.advanceReview();
+        break;
+      }
+
+      case 'reviewNextRound': {
+        const s = this.reviewSession;
+        if (!s || !s.nextItems.length) break;
+        s.round++;
+        s.items = s.nextItems.slice();
+        s.nextItems = [];
+        s.pos = 0;
+        s.roundStats = { know: 0, fuzzy: 0, unknown: 0 };
+        this.advanceReview();
+        break;
+      }
+
+      case 'reviewExtra': {
+        // 「再来 5 张」：取还没到期的词提前复习，不占用今日新词额度
+        const s = this.reviewSession;
+        const exclude = new Set<string>(s ? Object.keys(s.seen) : []);
+        const pool = this.reviewPool();
+        const states = this.reviews.all();
+        const picks = buildExtra(pool, states, exclude, 5);
+        if (!picks.length) {
+          /*
+           * 「再来 5 个」只挑已排期的词（buildExtra）。所以空结果有两种原因，
+           * 必须分开说 —— 只说「没有更多可复习的词了」会让用户对着 74 个
+           * 没复习过的收藏词一头雾水：明明有词，凭什么说没有了。
+           */
+          const freshLeft = pool.filter((c) => !states[c.key]).length;
+          this.pushReviewHome(
+            freshLeft
+              ? '已排期的词都练完了。收藏里还有 ' + freshLeft + ' 个词从没复习过，' +
+                '把设置里的 listenAndWrite.reviewNewWordsPerDay 调大（当前 ' +
+                this.reviewConfig().newWordsPerDay + '）就能每天引入更多。'
+              : '没有更多可复习的词了。'
+          );
+          break;
+        }
+        this.reviewSession = {
+          round: 0,
+          items: picks.map((c) => c.key),
+          pos: 0,
+          nextItems: [],
+          requeues: {},
+          seen: {},
+          heldKey: null,
+          stats: { know: 0, fuzzy: 0, unknown: 0 },
+          roundStats: { know: 0, fuzzy: 0, unknown: 0 },
+        };
+        this.advanceReview();
+        break;
+      }
+
+      case 'reviewRestart': {
+        // 收藏列表里「已掌握」的词 → 重新加入复习（level 归 0，立刻到期）
+        const key = reviewKey(String(msg.key ?? ''));
+        if (key) this.reviews.restart(key, Date.now());
+        this.pushFavorites();
+        break;
+      }
+
+      case 'reviewHome':
+        this.reviewSession = null;
+        this.pushReviewHome();
+        break;
+
       case 'favRetry': {
         // 手动「更新翻译」：只在用户进入收藏界面点按钮时才补译（不自动跑），
         // 失败的条目保持 pending，下次再点继续重试
@@ -719,6 +1170,11 @@ export class PracticePanel {
           } finally {
             this.favRemaining = 0;
             this.pushFavorites(false);
+            // 复习卡片上的「重新查询」走的也是这条通道：补译完成后重推当前卡，
+            // 让新拿到的释义立刻出现在翻面上（同一张卡不重置翻面状态）。
+            // ⚠️ 走 repushReviewCard 而不是 advanceReview：后者会把「已评分待确认」
+            //    的停留态顶掉，等于白丢一次停留。
+            if (this.reviewSession) this.repushReviewCard();
           }
         }).catch(() => { /* 队列链已吞异常 */ });
         break;
@@ -1738,6 +2194,26 @@ export class PracticePanel {
   .library { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
   .library.visible { display: flex; }
 
+  /* ---- 「复习」视图（收藏单词的间隔重复）----
+   * 容器复用 .library 的规则（显隐由 .visible 驱动），这里只加卡片样式。
+   * 正面只给单词，释义/例句留给翻面 —— 正面信息越少，自评越接近真实记忆。 */
+  .rv-top {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; color: var(--muted); flex: 0 0 auto;
+  }
+  .rv-card {
+    flex: 0 0 auto; padding: 22px 12px; text-align: center;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .rv-word { font-size: 26px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+  .rv-ph { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .rv-trans { font-size: 13px; line-height: 1.6; margin-bottom: 6px; }
+  .rv-sent { font-size: 12px; line-height: 1.6; margin-top: 4px; }
+  .rv-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; }
+  .rv-actions button { flex: 1 1 auto; min-width: 70px; padding: 8px 6px; font-size: 12px; }
+  .rv-actions button.rv-bad { color: var(--err); border-color: var(--err); }
+  .rv-actions button.rv-mid { color: var(--warn); border-color: var(--warn); }
+
   /* ---- 「诊断报告」视图 ----
    * ⚠️ 报告必须是独立视图，不能写进 #root（练习界面）：
    *    历史事故（2026-09-19）——报告写进 #root 且不切视图，于是在「发现 TED」/
@@ -1802,6 +2278,7 @@ export class PracticePanel {
   <button id="discoverBtn" class="ghost">发现 TED</button>
   <button id="libraryBtn" class="ghost">素材库</button>
   <button id="favBtn" class="ghost">收藏</button>
+  <button id="reviewBtn" class="ghost">复习</button>
   <button id="report" class="ghost">诊断报告</button>
   <!-- 布局切换：只在精听界面显示（文案是「点了会切到哪种布局」） -->
   <button id="layoutBtn" class="ghost" style="display:none">⇅ 上下布局</button>
@@ -1843,6 +2320,8 @@ export class PracticePanel {
 </div>
 
 <div id="favView" class="library"></div>
+
+<div id="reviewView" class="library"></div>
 
 <audio id="player" preload="auto"></audio>
 
@@ -1968,6 +2447,24 @@ let state = {
   // 切句后句号对不上自动失效，不用在每个切句入口清理
   favSelFor: -1,
   favSel: [],
+  /* ---- 复习（收藏单词的间隔重复） ----
+   * 这些全是【页面侧缓存】，权威数据在宿主（ReviewStore）。
+   * 页面只负责把宿主推来的卡片画出来 + 把评分发回去。 */
+  // 当前卡片（null = 不在答题中）
+  rvCard: null,
+  rvRound: 0,
+  rvIndex: 0,
+  rvTotal: 0,
+  // 是否已翻面（展示释义/例句）
+  rvReveal: false,
+  // 「已评分待确认」：没看答案就点了不认识/模糊 → 停在原地看答案，只留一个「下一个」
+  rvHeld: false,
+  // 复习首页数据（reviewHome）
+  rvHome: null,
+  // 轮次过场页数据（reviewRoundEnd）
+  rvRoundEnd: null,
+  // 本场结束页数据（reviewEnd）
+  rvEnd: null,
 };
 
 // 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
@@ -2156,6 +2653,47 @@ window.addEventListener('message', (e) => {
     libState.selected = {};
     renderLib();
   }
+  /* ---- 复习 ---- */
+  // 首页（进入复习视图 / 未开始时 / 本场结束后返回）
+  if (msg.type === 'reviewHome') {
+    state.rvHome = msg;
+    state.rvCard = null;
+    state.rvRoundEnd = null;
+    state.rvEnd = null;
+    state.rvHeld = false;
+    if (currentView === 'review') renderReviewView();
+  }
+  // 一张卡片（含轮次与进度）
+  if (msg.type === 'reviewCard') {
+    const prevKey = state.rvCard ? state.rvCard.key : null;
+    state.rvCard = msg.card;
+    state.rvRound = Number(msg.round) || 0;
+    state.rvIndex = Number(msg.index) || 0;
+    state.rvTotal = Number(msg.total) || 0;
+    // held = 宿主说这张卡「已经评过分、等你确认」→ 强制翻面并收掉自评按钮
+    state.rvHeld = !!msg.held;
+    // ★ 换卡必须重置翻面状态：否则上一张的释义会跟着新卡片显示出来（直接漏答案）。
+    //   同一张卡的刷新（如补译完成）保留翻面状态，不然刚查到的释义会被立刻收起。
+    if (state.rvHeld) state.rvReveal = true;
+    else if (msg.card.key !== prevKey) state.rvReveal = false;
+    state.rvRoundEnd = null;
+    state.rvEnd = null;
+    if (currentView === 'review') renderReviewView();
+  }
+  // 轮次过场页（本轮有需要重看的卡）
+  if (msg.type === 'reviewRoundEnd') {
+    state.rvRoundEnd = msg;
+    state.rvHeld = false;
+    if (currentView === 'review') renderReviewView();
+  }
+  // 本场结束
+  if (msg.type === 'reviewEnd') {
+    state.rvEnd = msg;
+    state.rvCard = null;
+    state.rvRoundEnd = null;
+    state.rvHeld = false;
+    if (currentView === 'review') renderReviewView();
+  }
   // 注意：视图切换已在上面按 progress/done/error 的来源分别处理，
   // 不要再在这里统一 showPracticeView() —— 那会把列表里的下载进度打断。
 });
@@ -2257,6 +2795,19 @@ function renderFavView() {
       ? '<button class="ex-play" data-fav-id="' + esc(f.id) + '" title="播放例句">🔊</button> '
       : '';
 
+    // 复习状态标记：只有单词会有进度（短语/整句不参与复习）。
+    // 用户必须能一眼看出「收藏的词复习到什么程度了」，否则复习是个黑箱。
+    let rvTag = '';
+    if (f.review) {
+      rvTag = f.review.mastered
+        ? '<span class="badge ok">✓ 已掌握</span>'
+        : '<span class="badge">' + rvDueText(f.review.dueAt) + '</span>';
+    }
+    const rvRestart = f.review && f.review.mastered
+      ? '<button class="ghost fav-rv-restart" data-key="' + esc(String(f.text).toLowerCase()) +
+        '" style="padding:0 5px;font-size:10px" title="回到复习池，从第 1 档重新开始">重新加入复习</button>'
+      : '';
+
     // 标题区：单词带音标（离线词典）；短语/整句渲染成可点 token（点词展开音标/释义）
     let title = esc(f.text);
     if (f.type === 'word' && !f.pending && f.phonetic) {
@@ -2286,7 +2837,7 @@ function renderFavView() {
 
     return '<div class="lib-card" data-k="' + k + '" data-fav-id="' + esc(f.id) + '">' +
       '<div class="t">' + title +
-        '<span class="badge">' + typeLabel + '</span>' +
+        '<span class="badge">' + typeLabel + '</span>' + rvTag +
         '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
           'style="float:right;padding:0 6px" title="删除">✕</button>' +
       '</div>' +
@@ -2303,6 +2854,7 @@ function renderFavView() {
         (canJump
           ? '<span class="jump-link" data-jump-k="' + k + '">' + sourceText + '</span>'
           : sourceText) +
+        (rvRestart ? ' ' + rvRestart : '') +
       '</div>' +
     '</div>';
   }).join('');
@@ -2347,6 +2899,13 @@ function renderFavView() {
       vscode.postMessage({ type: 'favRemove', id: btn.dataset.id });
     };
   });
+  // 「已掌握」的词 → 回到复习池（宿主清 mastered + level 归 0，回包刷新列表）
+  favView.querySelectorAll('.fav-rv-restart').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      vscode.postMessage({ type: 'reviewRestart', key: btn.dataset.key });
+    };
+  });
   // 来源行 = 跳转入口：跳过去后自动进入「看答案」状态并展开字幕列表
   favView.querySelectorAll('.jump-link').forEach((el) => {
     el.onclick = (e) => {
@@ -2374,6 +2933,236 @@ function renderFavView() {
     if (anchorCard) {
       favView.scrollTop += anchorCard.getBoundingClientRect().top - anchor.cardTop;
     }
+  }
+}
+
+/* ---------------- 复习视图 ---------------- */
+
+const reviewView = document.getElementById('reviewView');
+
+/** 相对时间（下次复习） */
+function rvDueText(dueAt) {
+  const t = Number(dueAt) || 0;
+  if (!t) return '待复习';
+  const d = t - Date.now();
+  if (d <= 0) return '待复习';
+  if (d < 3600000) return Math.max(1, Math.round(d / 60000)) + ' 分钟后';
+  if (d < 86400000) return Math.round(d / 3600000) + ' 小时后';
+  return Math.round(d / 86400000) + ' 天后';
+}
+
+/** 绝对时间（上次/下次复习，翻面后显示） */
+function rvTimeText(ts) {
+  const t = Number(ts) || 0;
+  if (!t) return '—';
+  const d = new Date(t);
+  const p = (n) => (n < 10 ? '0' + n : '' + n);
+  return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/**
+ * 自评按钮组。withReveal = 是否显示「看答案」。
+ * ⚠️ 「认识」用实心按钮（主操作），模糊/不认识用描边 —— 避免用户顺手点第一个。
+ */
+function rvActions(withReveal) {
+  let h = '';
+  if (withReveal) {
+    h += '<div class="rv-actions"><button id="rvReveal" class="ghost">看答案</button></div>';
+  }
+  h += '<div class="rv-actions">' +
+    '<button class="rv-grade ghost rv-bad" data-g="unknown">不认识</button>' +
+    '<button class="rv-grade ghost rv-mid" data-g="fuzzy">模糊</button>' +
+    '<button class="rv-grade" data-g="know">认识</button>' +
+    '</div>';
+  return h;
+}
+
+/**
+ * 复习视图：首页 / 卡片 / 轮次过场 / 结束页，四态互斥。
+ * 卡片正面【只有单词】，释义与例句留给翻面 —— 正面信息越少自评越真实。
+ */
+function renderReviewView() {
+  if (!reviewView) return;
+  let html = '';
+
+  // ---- 1) 结束页 ----
+  if (state.rvEnd) {
+    const s = state.rvEnd.stats || {};
+    const total = (s.know || 0) + (s.fuzzy || 0) + (s.unknown || 0);
+    html = '<div class="center" style="padding:18px 8px;line-height:1.9">' +
+      '<div style="font-size:14px">本场复习完成</div>' +
+      '<div style="color:var(--muted)">共 ' + total + ' 次评分：认识 ' + (s.know || 0) +
+        ' · 模糊 ' + (s.fuzzy || 0) + ' · 不认识 ' + (s.unknown || 0) + '</div>' +
+      '<div class="hint">24 小时内待复习 ' + (state.rvEnd.pendingCount || 0) + ' 个</div>' +
+      '<div style="margin-top:14px">' +
+        '<button id="rvExtra">再来 5 张</button> ' +
+        '<button id="rvBack" class="ghost">返回</button>' +
+      '</div>' +
+      '</div>';
+    reviewView.innerHTML = html;
+    const ex = document.getElementById('rvExtra');
+    if (ex) ex.onclick = () => vscode.postMessage({ type: 'reviewExtra' });
+    const bk = document.getElementById('rvBack');
+    if (bk) bk.onclick = () => vscode.postMessage({ type: 'reviewHome' });
+    return;
+  }
+
+  // ---- 2) 轮次过场页 ----
+  if (state.rvRoundEnd) {
+    const re = state.rvRoundEnd;
+    const s = re.stats || {};
+    html = '<div class="center" style="padding:18px 8px;line-height:1.9">' +
+      '<div style="font-size:14px">第 ' + re.finishedRound + ' 轮完成</div>' +
+      '<div style="color:var(--muted)">认识 ' + (s.know || 0) + ' · 模糊 ' + (s.fuzzy || 0) +
+        ' · 不认识 ' + (s.unknown || 0) + '</div>' +
+      '<div>接下来再看 ' + re.nextCount + ' 张</div>' +
+      '<div style="margin-top:14px"><button id="rvNext">继续第 ' +
+        (re.finishedRound + 1) + ' 轮</button></div>' +
+      '</div>';
+    reviewView.innerHTML = html;
+    const nb = document.getElementById('rvNext');
+    if (nb) {
+      nb.onclick = () => vscode.postMessage({ type: 'reviewNextRound' });
+      // 默认聚焦：回车即可继续。过场页只在本轮有重排卡时出现，一场最多 2 次
+      try { nb.focus(); } catch (e) { /* 桩环境忽略 */ }
+    }
+    return;
+  }
+
+  // ---- 3) 卡片 ----
+  if (state.rvCard) {
+    const c = state.rvCard;
+    html = '<div class="rv-top">' +
+      '<span>第 ' + (state.rvRound + 1) + ' 轮 · ' + (state.rvIndex + 1) + ' / ' + state.rvTotal + '</span>' +
+      '<span>' + (c.isNew ? '新词' : '第 ' + (c.level + 1) + ' 档') + '</span>' +
+      '</div>' +
+      '<div class="rv-card"><div class="rv-word">' + esc(c.text) + '</div>' +
+        (state.rvReveal && c.phonetic ? '<div class="rv-ph">' + esc(c.phonetic) + '</div>' : '') +
+      '</div>';
+
+    if (state.rvReveal) {
+      // ⚠️ 🔊 必须紧贴它朗读的那句例句。原先挂在「来源」行上，视觉上像是播演讲标题
+      const playBtn = c.canPlay
+        ? '<button id="rvPlay" class="ghost" style="padding:0 5px;margin-right:4px" ' +
+          'title="播放这句例句的音频">🔊</button>'
+        : '';
+      html += '<div class="answer">' +
+        (c.translation
+          ? '<div class="rv-trans">' + esc(c.translation) + '</div>'
+          : '<div>' +
+            (state.baiduConfigured
+              ? '<button id="rvRetry" class="ghost" style="padding:0 6px">重新查询释义</button>'
+              : '<span class="hint">本地词典未收录；配置百度翻译后可补译</span>') +
+            '</div>') +
+        ((c.sentenceText || playBtn)
+          ? '<div class="rv-sent">' + playBtn + esc(c.sentenceText || '') + '</div>'
+          : '') +
+        (c.sentenceTranslation
+          ? '<div class="rv-sent" style="color:var(--muted)">' + esc(c.sentenceTranslation) + '</div>'
+          : '') +
+        (c.talkTitle ? '<div class="hint" style="margin-top:6px">来源：' + esc(c.talkTitle) + '</div>' : '') +
+        '<div class="hint">上次 ' + rvTimeText(c.lastAt) + ' · 下次 ' + rvTimeText(c.dueAt) + '</div>' +
+      '</div>';
+    }
+
+    /*
+     * 停留态（已评分、等用户看完答案）：收掉三个自评按钮，只留一个往下走的按钮。
+     * ⚠️ 按钮文案要按「是不是本轮回最后一张」变 —— 最后一张还写「下一个」的话，
+     *    用户点下去直接蹦出小结页，会以为自己误触了。
+     */
+    const isLast = state.rvIndex + 1 >= state.rvTotal;
+    if (state.rvHeld) {
+      // 只有「最后一张」才给提示文案：它要解释按钮为什么叫「完成」而不是「下一个」。
+      // 平常那张卡上答案已经占满版面，再加一句「已记录…」纯属噪音。
+      if (isLast) {
+        html += '<div class="hint" style="text-align:center">本轮回最后一张</div>';
+      }
+      html += '<div class="rv-actions"><button id="rvGo">' +
+        (isLast ? '完成' : '下一个') + '</button></div>';
+    } else {
+      html += rvActions(!state.rvReveal);
+    }
+    reviewView.innerHTML = html;
+
+    const go = document.getElementById('rvGo');
+    if (go) {
+      go.onclick = () => {
+        go.disabled = true;
+        state.rvHeld = false;
+        vscode.postMessage({ type: 'reviewNext' });
+      };
+    }
+    const rev = document.getElementById('rvReveal');
+    if (rev) rev.onclick = () => { state.rvReveal = true; renderReviewView(); };
+    reviewView.querySelectorAll('.rv-grade').forEach((el) => {
+      el.onclick = () => {
+        // 本地防连点（宿主侧还会用 key 与游标比对再防一道）
+        reviewView.querySelectorAll('.rv-grade').forEach((b) => { b.disabled = true; });
+        vscode.postMessage({
+          type: 'reviewGrade',
+          key: c.key,
+          grade: el.dataset.g,
+          // 告诉宿主「点评分时看没看答案」：没看又点了不认识/模糊时，宿主会停在原地
+          revealed: !!state.rvReveal,
+        });
+      };
+    });
+    const rt = document.getElementById('rvRetry');
+    if (rt) rt.onclick = () => vscode.postMessage({ type: 'favRetry' });
+    const pl = document.getElementById('rvPlay');
+    if (pl) pl.onclick = () => vscode.postMessage({ type: 'favPlayExample', favId: c.favId });
+    return;
+  }
+
+  // ---- 4) 首页 ----
+  const h = state.rvHome;
+  if (!h) {
+    reviewView.innerHTML = '<div class="center">读取中…</div>';
+    return;
+  }
+  const totalWords = h.totalWords || 0;
+  const canStart = (h.dueCount || 0) + (h.newLeft || 0) > 0;
+  html = '<div class="center" style="padding:16px 10px;line-height:1.9">';
+  if (h.message) {
+    html += '<div class="answer" style="margin-bottom:10px;text-align:left">' + esc(h.message) + '</div>';
+  }
+  if (!totalWords) {
+    html += '收藏里还没有可复习的单词。<br>' +
+      '<span class="hint">在练习界面点「看答案」，点单词即可收藏' +
+      '（需要释义或例句，否则没东西可对照）。</span>' +
+      '<div style="margin-top:14px"><button id="rvGoFav" class="ghost">去收藏</button></div>';
+  } else {
+    /*
+     * 今日任务做完了就把主按钮换成「再来 5 个」（提前复习）。
+     * ⚠️ 不能只把「开始复习」disable 掉：用户练完一圈发现按钮灰了、
+     *    又不知道还能不能继续练，会以为功能坏了。给个明确的出口。
+     */
+    html += '<div>待复习 <b>' + (h.dueCount || 0) + '</b> 个 · 今日可引入新词 <b>' +
+      (h.newLeft || 0) + '</b> 个</div>' +
+      '<div class="hint">收藏单词 ' + totalWords + ' 个 · 已掌握 ' + (h.masteredCount || 0) + ' 个' +
+      (h.pendingCount ? ' · 24 小时内待复习 ' + h.pendingCount + ' 个' : '') + '</div>' +
+      '<div style="margin-top:14px">' +
+        (canStart
+          ? '<button id="rvStart">开始复习</button>'
+          : '<button id="rvExtra">再来 5 个</button>') +
+      '</div>' +
+      (canStart ? '' : '<div class="hint">今日复习已完成，明天继续</div>');
+  }
+  html += '</div>';
+  reviewView.innerHTML = html;
+
+  const st = document.getElementById('rvStart');
+  if (st) st.onclick = () => vscode.postMessage({ type: 'reviewStart' });
+  // 首页与结束页互斥，共用 rvExtra 这个 id 不会有冲突
+  const ex = document.getElementById('rvExtra');
+  if (ex) ex.onclick = () => vscode.postMessage({ type: 'reviewExtra' });
+  const gf = document.getElementById('rvGoFav');
+  if (gf) {
+    gf.onclick = () => {
+      showView('favorites');
+      renderFavView();
+      vscode.postMessage({ type: 'favListRequest' });
+    };
   }
 }
 
@@ -2406,13 +3195,14 @@ let discState = {
   download: {},
 };
 
-/* 四视图统一切换：practice / discover / library / report 互斥显示 */
+/* 视图统一切换：practice / discover / library / favorites / review / report 互斥显示 */
 const reportView = document.getElementById('reportView');
 const viewEls = {
   practice: document.getElementById('root'),
   discover: discView,
   library: libView,
   favorites: favView,
+  review: reviewView,
   report: reportView,
 };
 let currentView = 'practice';
@@ -2424,6 +3214,7 @@ const navBtn = {
   discover: document.getElementById('discoverBtn'),
   library: document.getElementById('libraryBtn'),
   favorites: document.getElementById('favBtn'),
+  review: document.getElementById('reviewBtn'),
   report: document.getElementById('report'),
 };
 
@@ -2488,6 +3279,13 @@ navBtn.favorites.onclick = () => {
   showView('favorites');
   renderFavView();
   vscode.postMessage({ type: 'favListRequest' });
+};
+
+navBtn.review.onclick = () => {
+  if (currentView === 'review') return;
+  showView('review');
+  renderReviewView();
+  vscode.postMessage({ type: 'reviewListRequest' });
 };
 
 /* ---------------- 精听界面快捷键与播放动作 ----------------

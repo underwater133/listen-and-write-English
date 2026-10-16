@@ -2,7 +2,7 @@
   "name": "listen-and-write-english",
   "displayName": "Listen & Write 听写英语",
   "description": "Listen & Write 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "publisher": "Azusa",
   "repository": {
     "type": "git",
@@ -121,6 +121,36 @@
           "type": "string",
           "default": "",
           "description": "百度翻译开放平台应用密钥。与 APP ID 配套填写；两者都填后，在收藏界面点「更新翻译」即可补全待翻译条目。"
+        },
+        "listenAndWrite.reviewLadder": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "1d",
+            "2d",
+            "4d",
+            "7d",
+            "15d",
+            "30d"
+          ],
+          "description": "复习间隔阶梯，从第 1 档到最后一档。写法：2h=2小时、1d=1天、1w=1周（也可写 10m=10分钟，只是天级复习用不上）。数组长度固定为 6（决定等级上限），改长度不生效；单项写错时该项回退默认值。答对一次用当前档位的间隔排期并升一档，最后一档再答对即视为已掌握。已经在排期的词不受修改影响，下次评分时才用新阶梯。"
+        },
+        "listenAndWrite.reviewNewWordsPerDay": {
+          "type": "number",
+          "default": 10,
+          "description": "复习时每天最多引入多少个「从未复习过」的新词。设为 0 则只复习已排期的词。"
+        },
+        "listenAndWrite.reviewRoundSize": {
+          "type": "number",
+          "default": 20,
+          "description": "每轮复习抽取的卡片数上限。"
+        },
+        "listenAndWrite.reviewMaxRequeue": {
+          "type": "number",
+          "default": 2,
+          "description": "一张卡在一场复习里最多被重新排到后面几次（评「不认识」时用）。"
         }
       }
     }

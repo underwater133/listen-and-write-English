@@ -604,6 +604,109 @@ check(
   '跳回原句的链路没接通（含 sourceUrl 下发与 dirName 动态解析），点击收藏卡片只会打开素材第一句'
 );
 
+/* ---------- 复习（收藏单词的间隔重复） ---------- */
+
+const reviewSrc = fs.readFileSync(path.join(__dirname, '../../src/core/review.ts'), 'utf8');
+const udSrc = fs.readFileSync(path.join(__dirname, '../../src/core/userdata.ts'), 'utf8');
+
+check(
+  'package.json: 复习 4 个配置项齐全（阶梯 / 新词额度 / 每轮张数 / 重排上限）',
+  /listenAndWrite\.reviewLadder/.test(pkg) &&
+    /listenAndWrite\.reviewNewWordsPerDay/.test(pkg) &&
+    /listenAndWrite\.reviewRoundSize/.test(pkg) &&
+    /listenAndWrite\.reviewMaxRequeue/.test(pkg),
+  '复习参数没暴露到设置项（设计要求可配置）'
+);
+check(
+  'review.ts: 进度主键是词形小写而非收藏 id（删了重收藏能继承历史）',
+  /export function reviewKey/.test(reviewSrc) &&
+    /trim\(\)\.toLowerCase\(\)/.test(reviewSrc) &&
+    /states\[reviewKey\(e\.text\)\]/.test(panel),
+  '复习进度绑在收藏 id 上，重新收藏同一个词会丢掉复习历史'
+);
+check(
+  'review.ts: 组池排除「既无释义又无例句」的词（否则翻面一片空白）',
+  /hasTranslation/.test(reviewSrc) && /hasSentence/.test(reviewSrc),
+  '缺释义且缺例句的词会进复习池，翻面没东西可对照'
+);
+check(
+  'review.ts: 重排额度封顶（不认识 = maxRequeue-已重排，模糊只在首次露面给 1 次）',
+  /config\.maxRequeue - requeues/.test(reviewSrc) && /requeues === 0 \? 1 : 0/.test(reviewSrc),
+  '重排预算没封顶，一张死活记不住的卡能把整场拖垮'
+);
+check(
+  'review.ts: 只有正面直接答对才升档（重排轮答对只给明天）',
+  /if \(requeues > 0\) \{[\s\S]{0,200}dueAt: now \+ DAY_MS/.test(reviewSrc),
+  '重排轮才想起来的「认识」是短时记忆，不该涨 level'
+);
+check(
+  'review.ts: 顶档再答对 → 标记已掌握，退出复习池',
+  /mastered: true \}/.test(reviewSrc),
+  '已掌握的词没有出口，复习池只增不减'
+);
+check(
+  'userdata.ts: review.json 已登记进用户数据清单（清缓存不删、换目录跟随迁移）',
+  /export const REVIEW_FILE = 'review.json'/.test(udSrc) &&
+    /path\.join\(STATS_DIR, REVIEW_FILE\)/.test(udSrc),
+  'review.json 没进 USER_DATA_RELS，清缓存或改 materialsDir 会丢掉全部复习进度'
+);
+check(
+  'panel.ts(宿主): 复习通道齐全 reviewListRequest/reviewStart/reviewGrade/reviewNextRound/reviewExtra/reviewRestart',
+  /case 'reviewListRequest'/.test(panel) && /case 'reviewStart'/.test(panel) &&
+    /case 'reviewGrade'/.test(panel) && /case 'reviewNextRound'/.test(panel) &&
+    /case 'reviewExtra'/.test(panel) && /case 'reviewRestart'/.test(panel),
+  'webview 与宿主的复习消息没接全'
+);
+check(
+  'panel.ts(宿主): 评分只认「当前这张卡」（防连点/乱序把分数写到别的词上）',
+  /if \(s\.items\[s\.pos\] !== key\) \{\s*\n\s*this\.repushReviewCard\(\);/.test(panel),
+  '评分没有与游标比对，连点会把评分写到错误的词头上'
+);
+check(
+  'panel.ts(宿主): 没看答案就点「不认识/模糊」→ 停在原地不推进游标',
+  /if \(!msg\.revealed && grade !== 'know'\) \{[\s\S]{0,120}s\.heldKey = key;/.test(panel) &&
+    /case 'reviewNext'/.test(panel),
+  '用户没看答案就点了不认识，卡片会被直接翻过去，白考一次'
+);
+check(
+  'panel.ts(宿主): 切回视图/补译刷新走 repushReviewCard（不顶掉停留态）',
+  /private repushReviewCard\(\): void/.test(panel) &&
+    /if \(this\.reviewSession\) this\.repushReviewCard\(\);/.test(panel),
+  '重渲染入口直接 advanceReview 会把用户正在看的答案顶掉'
+);
+check(
+  'panel.ts(页面): 停留态收掉自评按钮，只留「下一个 / 完成」',
+  /state\.rvHeld[\s\S]{0,500}id="rvGo"/.test(panel) && /isLast \? '完成' : '下一个'/.test(panel),
+  '停留态没换按钮，用户在最后一张会不知道自己该点哪里'
+);
+check(
+  'panel.ts(页面): 评分上报 revealed（宿主据此决定要不要停在原地）',
+  /revealed: !!state\.rvReveal/.test(panel),
+  '页面没告诉宿主看没看答案，宿主无法判断要不要停留'
+);
+check(
+  'panel.ts(页面): 今日任务做完 → 首页按钮换成「再来 5 个」而不是灰掉',
+  /canStart[\s\S]{0,220}开始复习[\s\S]{0,220}id="rvExtra">再来 5 个/.test(panel) &&
+    /今日复习已完成，明天继续/.test(panel),
+  '今日任务做完后只剩一个禁用的「开始复习」，用户不知道怎么继续练'
+);
+check(
+  'panel.ts(页面): 复习视图存在（reviewBtn 导航 + reviewView 容器 + renderReviewView）',
+  /id="reviewBtn"/.test(panel) && /id="reviewView"/.test(panel) &&
+    /function renderReviewView/.test(panel),
+  '复习视图没接进导航'
+);
+check(
+  'panel.ts(页面): 换卡时重置翻面状态（防上一张的释义漏给下一张）',
+  /state\.rvReveal = false/.test(panel),
+  '换卡不重置翻面状态，新卡片会直接带着上一张的答案出现'
+);
+check(
+  'panel.ts(复习卡片): 🔊 挂在例句行上，不在「来源」行',
+  /'<div class="rv-sent">' \+ playBtn \+ esc\(c\.sentenceText/.test(panel),
+  '朗读按钮脱离了它朗读的那句例句，看起来像在播演讲标题'
+);
+
 /* ---------- 离线词典（ECDICT 子集） ---------- */
 
 const dictSrc = fs.readFileSync(path.join(__dirname, '../../src/core/dictionary.ts'), 'utf8');

@@ -7,6 +7,7 @@
  *   现在用户数据 **跟随 materialsDir** 存到素材根目录：
  *     <materialsDir>/favorites.json
  *     <materialsDir>/stats/mistakes.jsonl
+ *     <materialsDir>/stats/review.json
  *   素材位置若是自定义绝对路径，卸载重装 / 换机都不会丢。
  *
  * ⚠️ 代价：素材根目录下因此混进了两个用户数据条目。凡是「清素材 / 遍历素材」
@@ -25,14 +26,23 @@ export const FAVORITES_FILE = 'favorites.json';
 export const STATS_DIR = 'stats';
 /** 错题记录文件名 */
 export const MISTAKES_FILE = 'mistakes.jsonl';
+/** 复习进度文件名（同样位于 stats/ 下） */
+export const REVIEW_FILE = 'review.json';
 
-/** 素材根下属于「用户数据」的条目名 —— 清缓存时必须保留 */
+/**
+ * 素材根下属于「用户数据」的条目名 —— 清缓存时必须保留。
+ * ⚠️ stats/ 整目录保留，因此 stats/review.json 天然受保护，不需要单独列。
+ */
 export function isUserDataEntry(name: string): boolean {
   return name === FAVORITES_FILE || name === STATS_DIR;
 }
 
 /** 用户数据相对素材根的路径清单 */
-const USER_DATA_RELS = [FAVORITES_FILE, path.join(STATS_DIR, MISTAKES_FILE)];
+const USER_DATA_RELS = [
+  FAVORITES_FILE,
+  path.join(STATS_DIR, MISTAKES_FILE),
+  path.join(STATS_DIR, REVIEW_FILE),
+];
 
 /**
  * 把用户数据（收藏 + 错题）从 fromRoot 搬到 toRoot。

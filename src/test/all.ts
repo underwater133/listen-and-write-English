@@ -8,6 +8,7 @@ const suites = [
   ['testWebviewHtml', 'webview HTML 生成器自检'],
   ['testCacheGuard', '缓存自检逻辑'],
   ['testMp4', 'MP4 封装器'],
+  ['testReview', '复习（间隔重复）调度与存储'],
 ];
 
 let totalPass = 0, totalFail = 0, allOk = true;
