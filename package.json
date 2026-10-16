@@ -1,14 +1,15 @@
 {
-  "name": "listen-and-write",
-  "displayName": "Listen & Write · 听写英语",
-  "description": "Listen & Write · 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
+  "name": "listen-and-write-english",
+  "displayName": "Listen & Write 听写英语",
+  "description": "Listen & Write 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
   "version": "0.0.1",
-  "publisher": "local",
+  "publisher": "Azusa",
   "repository": {
     "type": "git",
     "url": "https://github.com/underwater133/listen-and-write-English.git"
   },
   "license": "MIT",
+  "icon": "assets/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
