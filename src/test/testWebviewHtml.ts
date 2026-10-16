@@ -848,6 +848,41 @@ check(
     /将删除 \$\{count\} 条/.test(panel),
   '确认框没告诉用户后果有多重'
 );
+
+/* ---------- 用户数据跟随 materialsDir（2026-10-16） ----------
+ * 真实事故：收藏原先存 globalStorage，卸载扩展时被一起删掉 ——
+ * 用户「卸载重装后收藏全没了，素材库还在」（素材因配置 materialsDir 落在外部）。
+ * 修复：收藏/错题与素材同根，切目录时跟着搬，清音频缓存必须保留。
+ */
+check(
+  'extension.ts: 不再把 globalStorage 当用户数据根',
+  !/storage: context\.globalStorageUri\.fsPath/.test(extSrc),
+  'storage 仍指向 globalStorage，卸载重装依旧会丢收藏'
+);
+check(
+  'extension.ts: 激活时把旧 globalStorage 的用户数据迁到素材目录',
+  /migrateUserData\(legacyStorageRoot, cacheRoot\)/.test(extSrc),
+  '老用户升级后旧收藏会「消失」'
+);
+check(
+  'extension.ts: 清音频缓存逐项跳过用户数据（不再整根 rm -rf）',
+  /for \(const d of fs\.readdirSync\(cacheRoot[\s\S]{0,140}isUserDataEntry\(d\.name\)\) continue;/.test(
+    extSrc
+  ),
+  '清缓存会把收藏/错题一起删掉'
+);
+check(
+  'panel.ts: 收藏/错题以 cacheRoot 为存储根',
+  /new MistakeStore\(deps\.cacheRoot\)/.test(panel) &&
+    /new FavoriteStore\(deps\.cacheRoot\)/.test(panel),
+  '存储根没跟随素材目录'
+);
+check(
+  'package.json: materialsDir 描述说明收藏/诊断数据也存于此处',
+  /收藏与诊断报告数据/.test(pkg),
+  '用户不知道卸载重装前该备份哪里'
+);
+
 check('panel.ts: 绑定了 load 按钮点击', /getElementById\('load'\)\.onclick/.test(panel));
 check('panel.ts: 绑定了 report 按钮点击', /getElementById\('report'\)\.onclick/.test(panel));
 check('panel.ts: 含 audio error 监听', /player\.addEventListener\('error'/.test(panel));

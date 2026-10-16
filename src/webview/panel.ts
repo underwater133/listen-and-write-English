@@ -40,8 +40,13 @@ import { MistakeStore, trace } from '../extension';
 
 export interface PanelDeps {
   adapters: MaterialSourceAdapter[];
+  /**
+   * 素材根目录（materialsDir 解析结果）。
+   * ⚠️ 它同时也是【用户数据根】—— 收藏与错题记录就存在这里
+   *    （favorites.json / stats/mistakes.jsonl，见 core/userdata.ts）。
+   *    这样用户数据跟随 materialsDir，卸载重装不会丢。
+   */
   cacheRoot: string;
-  storage: string;
   /** 离线词典（ECDICT 子集）文件路径 */
   dictPath: string;
 }
@@ -157,7 +162,7 @@ export class PracticePanel {
   private readonly ctx: vscode.ExtensionContext;
   private readonly deps: PanelDeps;
   private readonly store: MistakeStore;
-  /** 收藏（单词/短语/整句）：用户数据，存 globalStorage/favorites.json */
+  /** 收藏（单词/短语/整句）：用户数据，存素材根目录的 favorites.json */
   private readonly favs: FavoriteStore;
   /** 百度翻译串行队列（标准版 QPS=1，队列内强制间隔） */
   private readonly tQueue = new TranslationQueue();
@@ -255,8 +260,9 @@ export class PracticePanel {
     this.kind = kind;
     this.ctx = ctx;
     this.deps = deps;
-    this.store = new MistakeStore(deps.storage);
-    this.favs = new FavoriteStore(deps.storage);
+    // 用户数据（错题/收藏）与素材同根 —— 跟随 materialsDir，卸载重装不丢
+    this.store = new MistakeStore(deps.cacheRoot);
+    this.favs = new FavoriteStore(deps.cacheRoot);
 
     this.webview.html = this.renderHtml();
 

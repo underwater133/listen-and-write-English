@@ -97,12 +97,17 @@
 | 设置键（`listenAndWrite.` 前缀） | 说明 |
 |---|---|
 | `proxy` | 访问 TED 用的代理地址，按需填写 |
-| `materialsDir` | 素材存放位置（绝对路径）。留空用默认位置；修改后已有素材自动迁移，重载窗口生效 |
+| `materialsDir` | 素材存放位置（绝对路径）。留空用默认位置；修改后已有素材自动迁移，重载窗口生效。**收藏与诊断报告数据也存放在此目录**，配置为外部目录后卸载重装 / 换机都不会丢 |
 | `audioQuality` | 音频质量 low / medium / high（默认 medium，约 8MB / 8 分钟） |
 | `concurrency` | 分片下载并发数（默认 6） |
 | `autoReplayOnError` | 听写错误时自动重播该句（默认开） |
 | `skipIntro` | 裁掉 TED 片头（默认开） |
 | `baiduAppId` / `baiduSecret` | 百度翻译凭证，用于收藏的单词/短语查词 |
+
+> **数据存放位置**：素材、收藏（`favorites.json`）与诊断报告错题记录（`stats/mistakes.jsonl`）
+> 都存放在 `materialsDir` 下。留空时位于扩展全局存储目录（`globalStorage`）——
+> 而该目录会随扩展卸载被删除，所以想保住收藏/诊断数据，请把 `materialsDir`
+> 配置成一个外部目录（如 `D:\ListeningMaterials`）。
 
 ## 开源协议
 

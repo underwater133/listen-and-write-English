@@ -14,6 +14,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { httpGetText } from './http';
+import { FAVORITES_FILE } from './userdata';
 
 export type FavoriteType = 'word' | 'phrase' | 'sentence';
 
@@ -162,7 +163,10 @@ export class TranslationQueue {
 }
 
 /**
- * 收藏存储：globalStorage/favorites.json，整文件读写。
+ * 收藏存储：<materialsDir>/favorites.json，整文件读写。
+ *
+ * ⚠️ 位置跟随素材目录（不再是 globalStorage）——globalStorage 会随卸载一起被
+ *    删掉（用户实测卸载重装后收藏全丢）。落点由 core/userdata.ts 定义。
  * 每次变更都重新 load → 改 → save（侧边栏与编辑器面板是两个实例共享同一
  * 文件，重读能把丢写窗口压到最小；用户实际只会同时操作一个界面）。
  * 文件损坏 → 视为空列表，绝不抛错（页面脚本抛错会整页按钮失效）。
@@ -170,8 +174,8 @@ export class TranslationQueue {
 export class FavoriteStore {
   private file: string;
 
-  constructor(storageRoot: string) {
-    this.file = path.join(storageRoot, 'favorites.json');
+  constructor(userDataRoot: string) {
+    this.file = path.join(userDataRoot, FAVORITES_FILE);
   }
 
   private load(): FavoriteEntry[] {

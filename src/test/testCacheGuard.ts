@@ -1,10 +1,11 @@
 /**
  * 缓存校验逻辑测试
  *
- * 覆盖三件事：
+ * 覆盖四件事：
  *   1. quickValidateAac 能正确识别坏文件
  *   2. 缓存路径重定位（素材目录被迁移后仍能复用，见 2026-09-19 事故）
  *   3. fetchAudio 的缓存复用闸门判据
+ *   4. 用户数据（收藏/错题）跟随 materialsDir 的迁移与保留规则
  *
  * 用法：node out/test/testCacheGuard.js
  */
@@ -14,6 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { quickValidateAac } from '../core/demux';
 import { relocateAudioPath, AudioInfo, AUDIO_CACHE_VERSION } from '../core/types';
+import { isUserDataEntry, migrateUserData } from '../core/userdata';
 
 let pass = 0;
 let fail = 0;
@@ -138,6 +140,77 @@ function main(): void {
     // 记录里的目录部分不可信：只允许取文件名，不能顺着 ".." 往外跑
     const escaping: AudioInfo = { ...info, path: path.join('..', '..', 'audio.mp3') };
     check('忽略记录里的目录部分（防越界）', relocateAudioPath(newDir, escaping) === path.join(newDir, 'audio.mp3'));
+
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  /* ---------- 7. 用户数据跟随 materialsDir ----------
+   *
+   * 真实事故（2026-10-16）：收藏原先存在 globalStorage 根下，卸载扩展会连它
+   * 一起删掉，用户「卸载重装后收藏全没了，素材库还在」（素材因为配置了
+   * materialsDir 落在外部目录而幸免）。现在收藏/错题与素材同根，并在切换
+   * 目录时跟着搬；清音频缓存必须保留它们。
+   */
+  {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lt-userdata-'));
+    const legacy = path.join(root, 'globalStorage');
+    const materials = path.join(root, 'materials');
+
+    // 旧位置：收藏 + 错题（外加一个不该被当作用户数据的素材目录作干扰项）
+    fs.mkdirSync(path.join(legacy, 'stats'), { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'favorites.json'), 'fav-legacy', 'utf8');
+    fs.writeFileSync(path.join(legacy, 'stats', 'mistakes.jsonl'), 'm1\n', 'utf8');
+    fs.mkdirSync(path.join(legacy, 'materials', 'ted-1'), { recursive: true });
+
+    const r = migrateUserData(legacy, materials);
+    check(
+      '用户数据迁移：收藏 + 错题都被搬走',
+      r.moved === 2 && r.skipped === 0,
+      `moved=${r.moved} skipped=${r.skipped}`
+    );
+    check(
+      '迁移后收藏落在素材根',
+      fs.readFileSync(path.join(materials, 'favorites.json'), 'utf8') === 'fav-legacy'
+    );
+    check(
+      '迁移后错题落在素材根',
+      fs.readFileSync(path.join(materials, 'stats', 'mistakes.jsonl'), 'utf8') === 'm1\n'
+    );
+    check(
+      '迁移是「搬」不是「复制」：旧位置的用户数据已移除',
+      !fs.existsSync(path.join(legacy, 'favorites.json'))
+    );
+    check(
+      '迁移不误伤旧位置里的素材目录',
+      fs.existsSync(path.join(legacy, 'materials', 'ted-1'))
+    );
+
+    const again = migrateUserData(legacy, materials);
+    check('迁移幂等（源已空则什么都不做）', again.moved === 0 && again.skipped === 0);
+    check('同根迁移是空操作', migrateUserData(materials, materials).moved === 0);
+
+    // 绝不覆盖：目标已有收藏时必须跳过，保留目标数据
+    const src2 = path.join(root, 'src2');
+    const dst2 = path.join(root, 'dst2');
+    fs.mkdirSync(src2, { recursive: true });
+    fs.mkdirSync(dst2, { recursive: true });
+    fs.writeFileSync(path.join(src2, 'favorites.json'), 'fav-src2', 'utf8');
+    fs.writeFileSync(path.join(dst2, 'favorites.json'), 'fav-dst2', 'utf8');
+    const r3 = migrateUserData(src2, dst2);
+    check('目标已有同名用户数据时不覆盖（跳过）', r3.moved === 0 && r3.skipped === 1);
+    check(
+      '目标原有数据保持原样',
+      fs.readFileSync(path.join(dst2, 'favorites.json'), 'utf8') === 'fav-dst2'
+    );
+
+    check(
+      'isUserDataEntry：favorites.json / stats 属于用户数据',
+      isUserDataEntry('favorites.json') && isUserDataEntry('stats')
+    );
+    check(
+      'isUserDataEntry：素材目录 / 杂项文件不算用户数据',
+      !isUserDataEntry('ted-1') && !isUserDataEntry('audio.mp3')
+    );
 
     fs.rmSync(root, { recursive: true, force: true });
   }

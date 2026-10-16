@@ -12,6 +12,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ListeningMaterial, MaterialSourceAdapter } from './core/types';
+import { isUserDataEntry, migrateUserData, MISTAKES_FILE, STATS_DIR } from './core/userdata';
 import { TedSource } from './sources/ted';
 import { MistakeRecord, SentenceResult } from './core/diff';
 import { PracticePanel } from './webview/panel';
@@ -20,6 +21,12 @@ import { SidebarViewProvider } from './webview/sidebar';
 let cacheRoot: string;
 /** 默认素材位置（globalStorage/materials）——materialsDir 未配置时的落点，也是迁移的源 */
 let defaultCacheRoot: string;
+/**
+ * 旧版用户数据位置：globalStorage 根（收藏 favorites.json / 错题 stats/mistakes.jsonl）。
+ * 现用户数据跟随 materialsDir 存到 cacheRoot 下（见 core/userdata.ts），
+ * 激活与切换目录时都会把这里的旧数据搬过去。
+ */
+let legacyStorageRoot: string;
 let adapters: MaterialSourceAdapter[] = [];
 let outChannel: vscode.OutputChannel;
 
@@ -135,6 +142,12 @@ function handleMaterialsDirChange(): void {
   const total = r1.moved + r2.moved;
   trace(`迁移完成: moved=${total} skipped=${r1.skipped + r2.skipped}`);
 
+  // ⚠️ 用户数据（收藏/错题）与素材同根，必须一起搬 —— 否则换了目录后
+  //    「收藏不见了」（其实还在旧目录里）。旧版 globalStorage 根也兜底一次。
+  migrateUserData(cacheRoot, newRoot);
+  if (defaultCacheRoot !== cacheRoot) migrateUserData(defaultCacheRoot, newRoot);
+  if (legacyStorageRoot) migrateUserData(legacyStorageRoot, newRoot);
+
   fs.mkdirSync(newRoot, { recursive: true });
   vscode.window
     .showInformationMessage(
@@ -159,10 +172,18 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(outChannel);
 
   defaultCacheRoot = path.join(context.globalStorageUri.fsPath, 'materials');
+  legacyStorageRoot = context.globalStorageUri.fsPath;
   const cfg = vscode.workspace.getConfiguration('listenAndWrite');
   cacheRoot = resolveCacheRoot(cfg.get<string>('materialsDir', ''));
   fs.mkdirSync(cacheRoot, { recursive: true });
   trace('activate: cacheRoot = ' + cacheRoot);
+
+  // 旧版把收藏/错题存在 globalStorage 根下（卸载重装就没了），
+  // 这里一次性搬到素材根目录（幂等：目标已有则跳过，绝不覆盖）。
+  const um = migrateUserData(legacyStorageRoot, cacheRoot);
+  if (um.moved) {
+    trace(`activate: 迁移 ${um.moved} 项用户数据（收藏/错题）到素材目录`);
+  }
 
   // 用户先在默认位置用了很久、后来才配置自定义位置的场景：
   // 激活时把默认位置的素材迁过去（幂等，目标同名则跳过）
@@ -212,7 +233,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const panelDeps = {
     adapters,
     cacheRoot,
-    storage: context.globalStorageUri.fsPath,
     dictPath: path.join(context.extensionPath, 'assets', 'dict.json.gz'),
   };
 
@@ -301,11 +321,16 @@ export function activate(context: vscode.ExtensionContext): void {
         '清空'
       );
       if (pick !== '清空') return;
+      // ⚠️ 不能整个 rm -rf cacheRoot：用户数据（收藏/错题）与素材同根，
+      //    一起删掉就等于「清个缓存把收藏清没了」。只删素材条目。
       if (fs.existsSync(cacheRoot)) {
-        fs.rmSync(cacheRoot, { recursive: true, force: true });
+        for (const d of fs.readdirSync(cacheRoot, { withFileTypes: true })) {
+          if (isUserDataEntry(d.name)) continue;
+          fs.rmSync(path.join(cacheRoot, d.name), { recursive: true, force: true });
+        }
       }
       fs.mkdirSync(cacheRoot, { recursive: true });
-      vscode.window.showInformationMessage('音频缓存已清空。');
+      vscode.window.showInformationMessage('音频缓存已清空（收藏与诊断数据已保留）。');
     })
   );
 }
@@ -320,14 +345,17 @@ export function deactivate(): void {
 
 /**
  * 追加式写入错误记录（jsonl），便于长期累积与统计
+ *
+ * ⚠️ 落点跟随素材目录（<materialsDir>/stats/mistakes.jsonl），不是 globalStorage
+ *    —— 卸载重装不会丢。见 core/userdata.ts。
  */
 export class MistakeStore {
   private file: string;
 
-  constructor(storageRoot: string) {
-    const dir = path.join(storageRoot, 'stats');
+  constructor(userDataRoot: string) {
+    const dir = path.join(userDataRoot, STATS_DIR);
     fs.mkdirSync(dir, { recursive: true });
-    this.file = path.join(dir, 'mistakes.jsonl');
+    this.file = path.join(dir, MISTAKES_FILE);
   }
 
   append(materialId: string, result: SentenceResult): void {

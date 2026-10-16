@@ -2,7 +2,7 @@
   "name": "listen-and-write-english",
   "displayName": "Listen & Write 听写英语",
   "description": "Listen & Write 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "Azusa",
   "repository": {
     "type": "git",
@@ -80,7 +80,7 @@
         "listenAndWrite.materialsDir": {
           "type": "string",
           "default": "",
-          "description": "素材存放位置（绝对路径），如 D:\\ListeningMaterials。留空使用默认位置（扩展全局存储下的 materials 目录）。修改后已下载的素材会自动迁移到新位置，重载窗口生效。"
+          "description": "素材存放位置（绝对路径），如 D:\\ListeningMaterials。留空使用默认位置（扩展全局存储下的 materials 目录）。修改后已下载的素材会自动迁移到新位置，重载窗口生效。收藏与诊断报告数据也存放在此目录（跟随本设置），配置为外部目录后卸载重装 / 换机都不会丢。"
         },
         "listenAndWrite.audioQuality": {
           "type": "string",
