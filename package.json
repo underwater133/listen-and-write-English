@@ -1,7 +1,7 @@
 {
   "name": "listen-and-write",
   "displayName": "Listen & Write · 听写英语",
-  "description": "Listen & Write · 听写英语 —— 逐句听写 + 词级 diff 诊断，把「听不懂」变成可追踪的数据",
+  "description": "Listen & Write · 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
   "version": "0.0.1",
   "publisher": "local",
   "repository": {

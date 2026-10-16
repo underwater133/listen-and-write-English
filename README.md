@@ -103,3 +103,7 @@
 | `autoReplayOnError` | 听写错误时自动重播该句（默认开） |
 | `skipIntro` | 裁掉 TED 片头（默认开） |
 | `baiduAppId` / `baiduSecret` | 百度翻译凭证，用于收藏的单词/短语查词 |
+
+## 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源，Copyright (c) 2026 Azusa。
