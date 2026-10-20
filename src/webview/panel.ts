@@ -2951,15 +2951,6 @@ function rvDueText(dueAt) {
   return Math.round(d / 86400000) + ' 天后';
 }
 
-/** 绝对时间（上次/下次复习，翻面后显示） */
-function rvTimeText(ts) {
-  const t = Number(ts) || 0;
-  if (!t) return '—';
-  const d = new Date(t);
-  const p = (n) => (n < 10 ? '0' + n : '' + n);
-  return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-
 /**
  * 自评按钮组。withReveal = 是否显示「看答案」。
  * ⚠️ 「认识」用实心按钮（主操作），模糊/不认识用描边 —— 避免用户顺手点第一个。
@@ -3061,7 +3052,6 @@ function renderReviewView() {
           ? '<div class="rv-sent" style="color:var(--muted)">' + esc(c.sentenceTranslation) + '</div>'
           : '') +
         (c.talkTitle ? '<div class="hint" style="margin-top:6px">来源：' + esc(c.talkTitle) + '</div>' : '') +
-        '<div class="hint">上次 ' + rvTimeText(c.lastAt) + ' · 下次 ' + rvTimeText(c.dueAt) + '</div>' +
       '</div>';
     }
 
