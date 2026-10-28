@@ -2940,15 +2940,29 @@ function renderFavView() {
 
 const reviewView = document.getElementById('reviewView');
 
-/** 相对时间（下次复习） */
+/**
+ * 下次复习的日期文案，按【自然日】算，不按毫秒差。
+ *
+ * ⚠️ 别改回「剩余毫秒 ÷ 一天」的写法：阶梯最小档就是 1 天，按毫秒算的话
+ *    刚评完下一秒 d 就小于 86400000，立刻掉进「24 小时后」分支 —— 于是
+ *    1 档的词整个周期都显示成小时数，看着完全不像「以天为单位」
+ *    （2026-10-28 实测反馈）。按自然日算才不会出现这种退化。
+ */
 function rvDueText(dueAt) {
   const t = Number(dueAt) || 0;
   if (!t) return '待复习';
-  const d = t - Date.now();
-  if (d <= 0) return '待复习';
-  if (d < 3600000) return Math.max(1, Math.round(d / 60000)) + ' 分钟后';
-  if (d < 86400000) return Math.round(d / 3600000) + ' 小时后';
-  return Math.round(d / 86400000) + ' 天后';
+  const now = Date.now();
+  if (t <= now) return '待复习';
+  const startOfDay = (ms) => {
+    const d = new Date(ms);
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  };
+  // 用四舍五入而不是取整：夏令时会让某一天变成 23 或 25 小时
+  const days = Math.round((startOfDay(t) - startOfDay(now)) / 86400000);
+  if (days <= 0) return '今天';
+  if (days === 1) return '明天';
+  return days + ' 天后';
 }
 
 /**

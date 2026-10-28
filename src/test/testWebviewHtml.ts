@@ -706,6 +706,13 @@ check(
   /'<div class="rv-sent">' \+ playBtn \+ esc\(c\.sentenceText/.test(panel),
   '朗读按钮脱离了它朗读的那句例句，看起来像在播演讲标题'
 );
+check(
+  'panel.ts(收藏列表): 复习日期按自然日算（待复习 / 今天 / 明天 / N 天后）',
+  /const days = Math\.round\(\(startOfDay\(t\) - startOfDay\(now\)\)/.test(panel) &&
+    /return '今天'/.test(panel) &&
+    /return '明天'/.test(panel),
+  '按毫秒差算会让 1 档的词整个周期都显示成「N 小时后」'
+);
 
 /* ---------- 离线词典（ECDICT 子集） ---------- */
 
