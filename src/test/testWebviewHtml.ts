@@ -714,6 +714,45 @@ check(
   '按毫秒差算会让 1 档的词整个周期都显示成「N 小时后」'
 );
 
+check(
+  'panel.ts(收藏): 分页每页 20 条，跳回原句按全量列表下标定位',
+  /const FAV_PAGE_SIZE = 20/.test(panel) &&
+    /idxById\.get\(f\.id\)/.test(panel) &&
+    /data-jump-k="' \+ k/.test(panel),
+  '分页后拿页内下标去做跳转，会跳到错误的收藏上'
+);
+check(
+  'panel.ts(收藏): 顶部按复习状态筛选（全部 / 待复习 / 已掌握 / 未复习）',
+  /const FAV_FILTERS = \[/.test(panel) &&
+    /key: 'due'/.test(panel) &&
+    /key: 'mastered'/.test(panel) &&
+    /key: 'fresh'/.test(panel),
+  '复习状态筛选没接上'
+);
+check(
+  'panel.ts(收藏): 页码越界会夹回，且筛选结果为空时筛选条仍可点',
+  /if \(state\.favPage > pages - 1\) state\.favPage = pages - 1;/.test(panel) &&
+    /bindFavChrome\(\);[\s\S]{0,60}return;/.test(panel),
+  '删条目/切筛选后可能停在空白页，而且点不回「全部」'
+);
+check(
+  'panel.ts(收藏): 搜索关键词与复习状态叠加过滤（不是互相覆盖）',
+  /id="favQuery"/.test(panel) &&
+    /const buckets = favBuckets\(favs, state\.favQuery\)/.test(panel),
+  '搜索没有并进筛选逻辑，两者会互相覆盖'
+);
+check(
+  'panel.ts(收藏): 搜索重渲染后还原焦点与光标（否则只能敲一个字）',
+  /const qFocus = !!qEl && document\.activeElement === qEl/.test(panel) &&
+    /nq\.setSelectionRange\(qSel, qSel\)/.test(panel),
+  '每次输入都重建输入框却不管焦点，搜索框实际不可用'
+);
+check(
+  'panel.ts(收藏): 输入法合成期间不重渲染（否则中文输入会被打断）',
+  /compositionstart/.test(panel) && /if \(composing\) return;/.test(panel),
+  'IME 合成中重渲染会打断输入法'
+);
+
 /* ---------- 离线词典（ECDICT 子集） ---------- */
 
 const dictSrc = fs.readFileSync(path.join(__dirname, '../../src/core/dictionary.ts'), 'utf8');

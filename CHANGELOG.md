@@ -4,6 +4,26 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.2] - 2026-10-28
+
+### 新增
+
+- **收藏视图支持搜索**：顶部搜索框可搜**词条 / 释义 / 例句 / 来源课程**，大小写不敏感，
+  `Esc` 或右侧 ✕ 清空
+- **收藏视图按复习状态筛选**：全部 / 待复习 / 已掌握 / 未复习，每项带实时数量，
+  与搜索条件叠加生效
+- **收藏视图分页**：每页 20 条，底部翻页；头部（搜索 + 筛选）吸顶
+
+### 修复
+
+- **收藏列表的复习日期改为自然日口径**：`待复习 / 今天 / 明天 / N 天后`。
+  之前按「剩余毫秒 ÷ 一天」算，而最小档位正好是 1 天 —— 于是 1 档的词从复习完
+  那一刻起就一直显示成「24 小时后」「3 小时后」，完全看不出「以天为单位」
+
+### 变更
+
+- 复习卡片翻面后不再显示「上次 / 下次」时间行
+
 ## [0.1.1] - 2026-10-16
 
 ### 新增
@@ -58,6 +78,7 @@
 - **布局切换**：左右布局 / 上下布局（窄窗口与侧边栏建议用上下布局）
 - **快捷键**：`a` 上一句 · `d` 下一句 · `空格` 播放/暂停 · `w` 切换播放模式 · `s` 切换倍速
 
+[0.1.2]: https://github.com/underwater133/listen-and-write-English/releases/tag/v0.1.2
 [0.1.1]: https://github.com/underwater133/listen-and-write-English/releases/tag/v0.1.1
 [0.0.2]: https://github.com/underwater133/listen-and-write-English/releases/tag/v0.0.2
 [0.0.1]: https://github.com/underwater133/listen-and-write-English/releases/tag/v0.0.1

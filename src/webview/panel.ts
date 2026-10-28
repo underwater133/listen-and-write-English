@@ -2240,6 +2240,34 @@ export class PracticePanel {
   .badge.ok { color: var(--ok); border: 1px solid currentColor; }
   .badge.no { color: var(--muted); border: 1px dashed currentColor; }
 
+  /* ---- 收藏视图：搜索 + 复习状态筛选 + 分页 ----
+   * 头部整块 sticky 吸顶：一页 20 条卡片很长，翻到一半想改关键词或换筛选
+   * 还得滚回顶部太难受。背景必须给，否则下面的卡片会从字缝里透出来。 */
+  .fav-head {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 2px 0 6px; margin-bottom: 2px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .fav-search { display: flex; gap: 4px; align-items: center; }
+  .fav-search input {
+    flex: 1 1 auto; min-width: 0;
+    padding: 3px 6px; font-size: 11px; font-family: inherit;
+    background: var(--input-bg); color: var(--input-fg);
+    border: 1px solid var(--input-border); border-radius: 3px; outline: none;
+  }
+  .fav-search input:focus { border-color: var(--accent); }
+  .fav-search button { flex: 0 0 auto; padding: 2px 6px; font-size: 11px; }
+  .fav-filters { display: flex; flex-wrap: wrap; gap: 4px; }
+  .fav-filters button { padding: 2px 7px; font-size: 11px; }
+  .fav-filters button.on { color: var(--accent); border-color: var(--accent); }
+  .fav-pager {
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 6px 0 2px; font-size: 11px; color: var(--muted);
+  }
+  .fav-pager button { padding: 2px 8px; font-size: 11px; }
+
   /* ---- 逐句时间轴微调条 ----
    * 折叠态只有一行标题，展开后是两行 ± 与一行操作。
    * 按钮一律 flex: 0 0 auto + 允许换行：侧边栏很窄，宁可换行也不能被压扁。 */
@@ -2443,6 +2471,10 @@ let state = {
   //   「点某个单词，那张卡片就跳位」。这里记住被点卡片【重建前】相对视口的位置，
   //   重建后重新对齐，使该卡片距顶部不变，变化的只有它下面的内容。
   favScrollAnchor: null,
+  // 收藏视图的搜索、筛选与分页（页面侧状态，不落盘；重载后回到「全部」第 1 页）
+  favQuery: '',
+  favFilter: 'all',
+  favPage: 0,
   // 答案面板里当前选中的词 token 序号（连续短语）；favSelFor = 选区归属的句号，
   // 切句后句号对不上自动失效，不用在每个切句入口清理
   favSelFor: -1,
@@ -2730,10 +2762,69 @@ function renderPtoks(text, favId) {
   return out;
 }
 
+/** 收藏列表每页条数 */
+const FAV_PAGE_SIZE = 20;
+
+/** 收藏视图顶部的复习状态筛选项（顺序即展示顺序） */
+const FAV_FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'due', label: '待复习' },
+  { key: 'mastered', label: '已掌握' },
+  { key: 'fresh', label: '未复习' },
+];
+
+/**
+ * 一条收藏的复习状态。
+ *   none     没有复习记录（短语/整句恒为 none —— 它们不参与复习）
+ *   due      已到期，现在就能复习
+ *   mastered 已掌握，退出复习池
+ *   later    已排期但还没到时间
+ *
+ * ⚠️ 判「到期」直接用 dueAt <= now，不要复用 rvDueText 的自然日口径：
+ *    那个是给人看日期的，这里是判断「现在能不能复习」，两回事。
+ */
+function favStatusOf(f) {
+  if (!f.review) return 'none';
+  if (f.review.mastered) return 'mastered';
+  return Number(f.review.dueAt) <= Date.now() ? 'due' : 'later';
+}
+
+/**
+ * 按复习状态分桶。返回的每个桶都保持原始顺序（宿主已按 createdAt 倒序推来）。
+ * 「未复习」只收单词 —— 短语/整句永远不会进复习池，混进去只会误导。
+ *
+ * 关键词（q）在这里一并过滤：这样筛选条上的数量是「搜索范围内各分类有多少条」，
+ * 而不是全量分类数量，用户能看出匹配结果落在哪一类里。
+ */
+function favBuckets(favs, q) {
+  const kw = String(q || '').trim().toLowerCase();
+  const hit = (f) => {
+    if (!kw) return true;
+    const ctx = f.context || {};
+    return (
+      String(f.text || '').toLowerCase().indexOf(kw) >= 0 ||
+      String(f.translation || '').toLowerCase().indexOf(kw) >= 0 ||
+      String(ctx.sentenceText || '').toLowerCase().indexOf(kw) >= 0 ||
+      String(ctx.talkTitle || '').toLowerCase().indexOf(kw) >= 0
+    );
+  };
+  const out = { all: [], due: [], mastered: [], fresh: [] };
+  for (const f of favs) {
+    if (!hit(f)) continue;
+    out.all.push(f);
+    const s = favStatusOf(f);
+    if (s === 'due') out.due.push(f);
+    else if (s === 'mastered') out.mastered.push(f);
+    else if (s === 'none' && f.type === 'word') out.fresh.push(f);
+  }
+  return out;
+}
+
 /**
  * 收藏列表：词条 + 译文 + 来源句。
  * - 未配置百度翻译 → 顶部提示条，pending 条目标 ⏳；
  * - 已配置且有 pending → 显示「更新翻译」按钮（手动触发，QPS=1 串行）；
+ * - 顶部按复习状态筛选，底部按 FAV_PAGE_SIZE 分页；
  * - 点卡片跳回原句（宿主 openCached 带 sentenceIndex）；✕ 删除。
  */
 function renderFavView() {
@@ -2743,6 +2834,21 @@ function renderFavView() {
   state.favScrollAnchor = null;
   const favs = state.favorites;
   const pendingCount = favs.filter((f) => f.pending).length;
+
+  /*
+   * 搜索框会随整段 innerHTML 重建，所以先记住焦点与光标位置，重建完还回去。
+   * 不这么做的话每敲一个字就丢焦点 —— 搜索框等于只能输入一个字符。
+   */
+  const qEl = document.getElementById('favQuery');
+  const qFocus = !!qEl && document.activeElement === qEl;
+  const qSel = qEl ? qEl.selectionStart : 0;
+  const restoreQueryFocus = () => {
+    if (!qFocus) return;
+    const nq = document.getElementById('favQuery');
+    if (!nq) return;
+    nq.focus();
+    try { nq.setSelectionRange(qSel, qSel); } catch (e) { /* 某些输入类型不支持选区 */ }
+  };
 
   let html = '';
   if (!state.baiduConfigured) {
@@ -2769,7 +2875,47 @@ function renderFavView() {
     return;
   }
 
-  html += favs.map((f, k) => {
+  /* ---- 搜索 + 筛选 + 分页 ---- */
+  const buckets = favBuckets(favs, state.favQuery);
+  const list = buckets[state.favFilter] || buckets.all;
+  const pages = Math.max(1, Math.ceil(list.length / FAV_PAGE_SIZE));
+  // 删条目 / 切筛选后页码可能越界，夹回来 —— 否则会渲染出空白的「第 3/2 页」
+  if (state.favPage > pages - 1) state.favPage = pages - 1;
+  if (state.favPage < 0) state.favPage = 0;
+  const start = state.favPage * FAV_PAGE_SIZE;
+  const page = list.slice(start, start + FAV_PAGE_SIZE);
+  // 跳回原句按【全量列表】的下标定位，不能用页内下标，否则会跳到别的收藏上
+  const idxById = new Map();
+  favs.forEach((f, i) => idxById.set(f.id, i));
+
+  html += '<div class="fav-head">' +
+    '<div class="fav-search">' +
+      '<input id="favQuery" type="text" placeholder="搜索单词 / 释义 / 例句 / 来源…" value="' +
+        esc(state.favQuery) + '" />' +
+      (state.favQuery
+        ? '<button id="favQueryClear" class="ghost" title="清空搜索">✕</button>'
+        : '') +
+    '</div>' +
+    '<div class="fav-filters">';
+  for (const it of FAV_FILTERS) {
+    const n = buckets[it.key].length;
+    html += '<button class="ghost fav-filter' + (state.favFilter === it.key ? ' on' : '') +
+      '" data-f="' + it.key + '">' + it.label + ' ' + n + '</button>';
+  }
+  html += '</div></div>';
+
+  if (!list.length) {
+    html += '<div class="center">' + (state.favQuery
+      ? '没有匹配「' + esc(state.favQuery) + '」的条目。<br>换个关键词，或清空搜索框。'
+      : '这个分类下没有条目。<br>点上方「全部」查看所有收藏。') + '</div>';
+    favView.innerHTML = html;
+    bindFavChrome();
+    restoreQueryFocus();
+    return;
+  }
+
+  html += page.map((f) => {
+    const k = idxById.get(f.id);
     const ctx = f.context || {};
     // 释义行：整句不在这里显示（translation 就是原句译文，与下方「译：」重复）；
     // 单词/短语按 ； 与换行拆成 chip 展示（词典/百度的多义项都适用）
@@ -2859,7 +3005,18 @@ function renderFavView() {
     '</div>';
   }).join('');
 
+  // 分页条：只有一页时也显示总数，让用户知道这个分类里到底有多少条
+  html += '<div class="fav-pager">' +
+    '<button id="favPrev" class="ghost"' + (state.favPage === 0 ? ' disabled' : '') +
+      '>上一页</button>' +
+    '<span>' + (state.favPage + 1) + ' / ' + pages + ' · 共 ' + list.length + ' 条</span>' +
+    '<button id="favNext" class="ghost"' + (state.favPage >= pages - 1 ? ' disabled' : '') +
+      '>下一页</button>' +
+    '</div>';
+
   favView.innerHTML = html;
+  bindFavChrome();
+  restoreQueryFocus();
 
   const retry = document.getElementById('favRetry');
   if (retry) retry.onclick = () => vscode.postMessage({ type: 'favRetry' });
@@ -2933,6 +3090,84 @@ function renderFavView() {
     if (anchorCard) {
       favView.scrollTop += anchorCard.getBoundingClientRect().top - anchor.cardTop;
     }
+  }
+}
+
+/** 更新搜索关键词：重置到第 1 页后整段重渲染（光标位置由 renderFavView 还回去） */
+function applyFavQuery(v) {
+  const next = String(v || '');
+  if (next === state.favQuery) return;
+  state.favQuery = next;
+  state.favPage = 0;
+  renderFavView();
+}
+
+/**
+ * 绑定收藏视图的搜索框、筛选条与分页按钮。
+ *
+ * ⚠️ 单独抽出来而不是塞在 renderFavView 的卡片绑定里：筛选结果为空时
+ *    会提前 return，那时【仍然要能改关键词、点筛选条切回「全部」】，
+ *    否则用户就卡死在空页上了。
+ */
+function bindFavChrome() {
+  if (!favView) return;
+  const q = document.getElementById('favQuery');
+  if (q) {
+    // ⚠️ 中文/拼音输入法合成期间绝不能重渲染，否则会把正在合成的串打断
+    let composing = false;
+    q.addEventListener('compositionstart', () => { composing = true; });
+    q.addEventListener('compositionend', () => {
+      composing = false;
+      applyFavQuery(q.value);
+      favView.scrollTop = 0;
+    });
+    q.addEventListener('input', (e) => {
+      if (composing) return;
+      applyFavQuery(e.target.value);
+      favView.scrollTop = 0;
+    });
+    q.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        q.value = '';
+        applyFavQuery('');
+      }
+    });
+  }
+  const qc = document.getElementById('favQueryClear');
+  if (qc) {
+    qc.onclick = () => {
+      state.favQuery = '';
+      state.favPage = 0;
+      renderFavView();
+      favView.scrollTop = 0;
+    };
+  }
+  favView.querySelectorAll('.fav-filter').forEach((btn) => {
+    btn.onclick = () => {
+      if (state.favFilter === btn.dataset.f) return;
+      state.favFilter = btn.dataset.f;
+      state.favPage = 0;
+      renderFavView();
+      favView.scrollTop = 0;
+    };
+  });
+  const prev = document.getElementById('favPrev');
+  if (prev) {
+    prev.onclick = () => {
+      if (state.favPage <= 0) return;
+      state.favPage -= 1;
+      renderFavView();
+      favView.scrollTop = 0;
+    };
+  }
+  const next = document.getElementById('favNext');
+  if (next) {
+    next.onclick = () => {
+      state.favPage += 1;
+      renderFavView();
+      favView.scrollTop = 0;
+    };
   }
 }
 
