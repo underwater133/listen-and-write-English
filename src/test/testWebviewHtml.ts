@@ -685,6 +685,32 @@ check(
   '页面没告诉宿主看没看答案，宿主无法判断要不要停留'
 );
 check(
+  'panel.ts(复习快捷键): 空格播放例句 / a 不认识 / s 模糊 / d 认识（停留态为下一个）',
+  /function rvGrade\(grade\)/.test(panel) &&
+    /function rvGoNext\(\)/.test(panel) &&
+    /function rvPlayExample\(\)/.test(panel) &&
+    // 按钮与快捷键必须调同一套函数，否则行为会漂移
+    /el\.onclick = \(\) => rvGrade\(el\.dataset\.g\)/.test(panel) &&
+    /if \(go\) go\.onclick = \(\) => rvGoNext\(\)/.test(panel) &&
+    /case ' ': e\.preventDefault\(\); rvPlayExample\(\); break;/.test(panel) &&
+    /case 'a': rvGrade\('unknown'\); break;/.test(panel) &&
+    /case 's': rvGrade\('fuzzy'\); break;/.test(panel) &&
+    /case 'd': if \(state\.rvHeld\) rvGoNext\(\); else rvGrade\('know'\); break;/.test(panel),
+  '复习界面快捷键缺失，或与按钮各写一套逻辑'
+);
+check(
+  'panel.ts(复习快捷键): 只在复习视图且不在输入框里抢键（首页/过场/结束页无卡时不响应）',
+  /currentView !== 'review'\) return;/.test(panel) &&
+    /if \(!state\.rvCard\) return;/.test(panel) &&
+    /if \(e\.repeat\) return;/.test(panel),
+  '缺少视图/输入框/重复键守卫，按键会在别的界面或过场页被误触发'
+);
+check(
+  'panel.ts(复习快捷键): 说明文字在按钮行下方且是小字（.rv-keys）',
+  /class="rv-keys"/.test(panel) && /\.rv-keys \{[^}]*font-size: 11px/.test(panel),
+  '快捷键说明缺失，或没有跟在按钮行下方的小字样式'
+);
+check(
   'panel.ts(页面): 今日任务做完 → 首页按钮换成「再来 5 个」而不是灰掉',
   /canStart[\s\S]{0,220}开始复习[\s\S]{0,220}id="rvExtra">再来 5 个/.test(panel) &&
     /今日复习已完成，明天继续/.test(panel),

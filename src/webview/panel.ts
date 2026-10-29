@@ -2213,6 +2213,13 @@ export class PracticePanel {
   .rv-actions button { flex: 1 1 auto; min-width: 70px; padding: 8px 6px; font-size: 12px; }
   .rv-actions button.rv-bad { color: var(--err); border-color: var(--err); }
   .rv-actions button.rv-mid { color: var(--warn); border-color: var(--warn); }
+  /* 快捷键说明：紧贴按钮行下方的小字。颜色/字号比 .hint 再收一档，
+   * 目的是「想看能查到、不想看不碍眼」—— 卡片区版面本来就紧。 */
+  .rv-keys {
+    flex: 0 0 auto; text-align: center;
+    font-size: 11px; line-height: 1.5; color: var(--muted); opacity: .85;
+  }
+  .rv-keys b { font-weight: 600; font-family: var(--vscode-editor-font-family, Consolas, monospace); }
 
   /* ---- 「诊断报告」视图 ----
    * ⚠️ 报告必须是独立视图，不能写进 #root（练习界面）：
@@ -3203,8 +3210,12 @@ function rvDueText(dueAt) {
 /**
  * 自评按钮组。withReveal = 是否显示「看答案」。
  * ⚠️ 「认识」用实心按钮（主操作），模糊/不认识用描边 —— 避免用户顺手点第一个。
+ *
+ * 快捷键说明（.rv-keys）紧跟按钮行下方，小字；
+ * ⚠️ 空格只在【这张卡真的有例句音频】时才写进说明（canPlay）——
+ *    没音频还提示「空格播放」，用户按了没反应会以为快捷键坏了。
  */
-function rvActions(withReveal) {
+function rvActions(withReveal, canPlay) {
   let h = '';
   if (withReveal) {
     h += '<div class="rv-actions"><button id="rvReveal" class="ghost">看答案</button></div>';
@@ -3214,7 +3225,52 @@ function rvActions(withReveal) {
     '<button class="rv-grade ghost rv-mid" data-g="fuzzy">模糊</button>' +
     '<button class="rv-grade" data-g="know">认识</button>' +
     '</div>';
+  h += '<div class="rv-keys">' +
+    (canPlay ? '<b>空格</b> 播放例句　' : '') +
+    '<b>a</b> 不认识　<b>s</b> 模糊　<b>d</b> 认识' +
+    '</div>';
   return h;
+}
+
+/**
+ * 卡片上的三个动作。★ 按钮与快捷键走同一套函数，行为永远一致
+ * （与精听界面 a/d/空格 的做法一致，见下文 keydown）。
+ */
+function rvGrade(grade) {
+  const c = state.rvCard;
+  if (!c) return;
+  // 本地防连点（宿主侧还会用 key 与游标比对再防一道）。
+  // ⚠️ 按钮已禁用 = 上一笔评分还没回包：必须直接返回。
+  //    鼠标连点会被 disabled 属性挡住，但键盘连按不会 ——
+  //    第二笔评分对宿主来说仍是「当前这张卡」，会被当成重复评分收下。
+  const btns = reviewView.querySelectorAll('.rv-grade');
+  if (btns.length && btns[0].disabled) return;
+  btns.forEach((b) => { b.disabled = true; });
+  vscode.postMessage({
+    type: 'reviewGrade',
+    key: c.key,
+    grade: grade,
+    // 告诉宿主「点评分时看没看答案」：没看又点了不认识/模糊时，宿主会停在原地
+    revealed: !!state.rvReveal,
+  });
+}
+
+/** 停留态的「下一个 / 完成」 */
+function rvGoNext() {
+  if (!state.rvCard) return;
+  const go = document.getElementById('rvGo');
+  // 已禁用 = 上一笔还没回包，键盘连按不要再发一次
+  if (go && go.disabled) return;
+  if (go) go.disabled = true;
+  state.rvHeld = false;
+  vscode.postMessage({ type: 'reviewNext' });
+}
+
+/** 播放这张卡的例句音频（复用收藏视图那条通道，主 player 播片段） */
+function rvPlayExample() {
+  const c = state.rvCard;
+  if (!c || !c.canPlay) return;
+  vscode.postMessage({ type: 'favPlayExample', favId: c.favId });
 }
 
 /**
@@ -3318,38 +3374,28 @@ function renderReviewView() {
       }
       html += '<div class="rv-actions"><button id="rvGo">' +
         (isLast ? '完成' : '下一个') + '</button></div>';
+      // 停留态只有 d 一个可用的键（空格照旧能重听例句）——
+      // 这里不列自评键：那三个按钮此时是收起来的，列出来只会让人去按
+      html += '<div class="rv-keys">' +
+        (c.canPlay ? '<b>空格</b> 播放例句　' : '') +
+        '<b>d</b> ' + (isLast ? '完成' : '下一个') +
+        '</div>';
     } else {
-      html += rvActions(!state.rvReveal);
+      html += rvActions(!state.rvReveal, !!c.canPlay);
     }
     reviewView.innerHTML = html;
 
     const go = document.getElementById('rvGo');
-    if (go) {
-      go.onclick = () => {
-        go.disabled = true;
-        state.rvHeld = false;
-        vscode.postMessage({ type: 'reviewNext' });
-      };
-    }
+    if (go) go.onclick = () => rvGoNext();
     const rev = document.getElementById('rvReveal');
     if (rev) rev.onclick = () => { state.rvReveal = true; renderReviewView(); };
     reviewView.querySelectorAll('.rv-grade').forEach((el) => {
-      el.onclick = () => {
-        // 本地防连点（宿主侧还会用 key 与游标比对再防一道）
-        reviewView.querySelectorAll('.rv-grade').forEach((b) => { b.disabled = true; });
-        vscode.postMessage({
-          type: 'reviewGrade',
-          key: c.key,
-          grade: el.dataset.g,
-          // 告诉宿主「点评分时看没看答案」：没看又点了不认识/模糊时，宿主会停在原地
-          revealed: !!state.rvReveal,
-        });
-      };
+      el.onclick = () => rvGrade(el.dataset.g);
     });
     const rt = document.getElementById('rvRetry');
     if (rt) rt.onclick = () => vscode.postMessage({ type: 'favRetry' });
     const pl = document.getElementById('rvPlay');
-    if (pl) pl.onclick = () => vscode.postMessage({ type: 'favPlayExample', favId: c.favId });
+    if (pl) pl.onclick = () => rvPlayExample();
     return;
   }
 
@@ -3596,6 +3642,34 @@ document.addEventListener('keydown', (e) => {
     case ' ': e.preventDefault(); togglePlayPause(); break;
     case 'w': cyclePlayMode(); break;
     case 's': cycleRate(); break;
+  }
+});
+
+/* ---------------- 复习界面快捷键 ----------------
+ * 空格 = 播放例句音频 / a = 不认识 / s = 模糊 / d = 认识（停留态里是「下一个」）
+ *
+ * ⚠️ d 一键两义是刻意的：自评时它是「认识」，停留态（已评分、等你看答案）里
+ *    自评按钮已经收起、屏幕上只剩「下一个 / 完成」那一个按钮，不存在歧义 ——
+ *    于是「a 不认识 → 看一眼答案 → d 继续」可以一路盲打，手不用离开键盘。
+ * ⚠️ 与精听界面同一套守卫：只在复习视图、不带修饰键、输入框聚焦时不抢键。
+ *    e.repeat 也拦掉：按住不放在宿主侧会被当成连点评分。
+ * ⚠️ 首页 / 轮次过场页 / 结束页没有卡，直接不管（否则空格会把过场页
+ *    已聚焦的「继续」按钮的默认行为抢掉）。
+ */
+document.addEventListener('keydown', (e) => {
+  if (currentView !== 'review') return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  if (e.repeat) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) {
+    return; // 正在输入，按键属于输入框
+  }
+  if (!state.rvCard) return;
+  switch (e.key) {
+    case ' ': e.preventDefault(); rvPlayExample(); break;
+    case 'a': rvGrade('unknown'); break;
+    case 's': rvGrade('fuzzy'); break;
+    case 'd': if (state.rvHeld) rvGoNext(); else rvGrade('know'); break;
   }
 });
 
