@@ -14,6 +14,7 @@ out/
 Thumbs.db
 *.log
 .workbuddy/
+.codebuddy/
 
 # 本地实验产物
 *.mp3

@@ -879,6 +879,92 @@ check(
   '已选中的词点不掉'
 );
 
+/* ---------- 收藏标记（文字色 + 下划线，无背景） ---------- */
+
+check(
+  'panel.ts(页面): 已收藏标记只改文字色 + 下划线，不铺背景底色',
+  /\.tok\.fav-word \{[^}]*color: var\(--fav-word\)/.test(panel) &&
+    /\.tok\.fav-word \{[^}]*text-decoration: underline/.test(panel) &&
+    /\.tok\.fav-phrase \{[^}]*text-decoration: underline/.test(panel) &&
+    !/\.tok\.fav-(word|phrase|sentence) \{[^}]*background/.test(panel) &&
+    !/\.lmark(\.\w+)? \{[^}]*background/.test(panel),
+  '收藏标记改用了背景色（需求是只改字体颜色 + 下划线）'
+);
+check(
+  'panel.ts(页面): 选中态排在收藏标记之后并显式去掉下划线',
+  /\.tok\.sel \{(?=[^}]*background: var\(--accent\))(?=[^}]*text-decoration: none)/.test(panel),
+  '选中态没压过收藏色，或选中后仍拖着收藏下划线'
+);
+check(
+  'panel.ts(页面): 三类标记用主题自适应颜色（charts-*）',
+  /--fav-word: var\(--vscode-charts-yellow/.test(panel) &&
+    /--fav-phrase: var\(--vscode-charts-blue/.test(panel) &&
+    /--fav-sentence: var\(--vscode-charts-green/.test(panel),
+  '颜色写死会在浅色/深色主题之一里看不清'
+);
+check(
+  'panel.ts(页面): 收藏命中索引按 favorites 数组身份缓存（点词重建 DOM 不重算）',
+  /favIndex\.list === state\.favorites/.test(panel) &&
+    /favHits\.list !== state\.favorites/.test(panel) &&
+    /function favMarksOf/.test(panel),
+  '每次渲染都重算索引，收藏一多点词就卡'
+);
+check(
+  'panel.ts(页面): 短语按 token 序列匹配（indexOf 会误命中 to become）',
+  /map\.phrases\.get\(lower\[i\]\)/.test(panel) &&
+    /lower\[i \+ k\] !== p\.words\[k\]/.test(panel),
+  '短语匹配退化成子串查找'
+);
+check(
+  'panel.ts(页面): 收藏索引按 token 归一（历史数据带标点也能命中）',
+  /favWordKey\(f\.text\) \|\| key/.test(panel) &&
+    /answerTokens\(f\.text\)\.map\(\(t\) => t\.toLowerCase\(\)\)/.test(panel),
+  '历史收藏里混进标点或多余空白时会永远命不中'
+);
+check(
+  'panel.ts: ready 时先推收藏再推素材（首屏就能看到标记）',
+  /case 'ready':[\s\S]{0,320}pushConfig\(\)[\s\S]{0,200}pushFavorites\(\)[\s\S]{0,160}pushMaterial\(\)/.test(panel),
+  '首屏不下发收藏列表，用户必须先进一次「收藏」视图才看得到标记'
+);
+check(
+  'panel.ts: 收藏回执带权威条目（favAdded.fav），页面据此即时上色',
+  /type: 'favAdded', deduped, fav: saved/.test(panel) &&
+    /const added = msg\.fav;/.test(panel) &&
+    /state\.favorites\.concat\(\[added\]\)/.test(panel),
+  '新增收藏只靠后续 favList，回执丢失或滞后就永远没有标记'
+);
+check(
+  'panel.ts(页面): 点已收藏短语/整句 → 整块锁定，取最小跨度',
+  /const unit = favUnitAt\(favRes, wi\)/.test(panel) &&
+    /\(sp\.end - sp\.start\) < \(best\.end - best\.start\)/.test(panel),
+  '收藏的短语/整句还能被拆成单词单独收藏'
+);
+check(
+  'panel.ts(页面): 选区已收藏时按钮变「取消收藏」',
+  /id="favSelRemove"/.test(panel) &&
+    /f\.type === \(state\.favSel\.length > 1 \? 'phrase' : 'word'\)/.test(panel) &&
+    /type: 'favRemove', id: selFav\.id/.test(panel),
+  '已收藏的单词/短语仍然只能点「收藏所选」'
+);
+check(
+  'panel.ts(页面): 整句收藏命中忽略标点差异（收藏带句号 vs 选区不带）',
+  /function favWordKey\(text\)/.test(panel) &&
+    /answerTokens\(text\)\.join\(' '\)\.toLowerCase\(\)/.test(panel) &&
+    /favWordKey\(f\.text\) === selKey/.test(panel) &&
+    /favWordKey\(f\.text\) === sentWordKey/.test(panel),
+  '整句收藏带标点、选区不带，比较键不一致 → 选完整句仍显示「收藏所选」'
+);
+check(
+  'panel.ts(页面): 字幕列表用 lmark 标记，且不引入可点暗示',
+  /renderListText\(s\.text\)/.test(panel) &&
+    /class="lmark f' \+ mk/.test(panel) &&
+    /text-decoration-skip-ink: none/.test(panel) &&
+    /res\.marks\[j \+ 1\] === mk/.test(panel) &&
+    !/\.lmark[^}]*cursor: pointer/.test(panel) &&
+    !/\.item\.active \.lmark[^}]*color: inherit/.test(panel),
+  '列表没接标记、下划线会在 g/y 处断开、逐词没合并，或把逐词做成了可点区域'
+);
+
 // ★ 回归防线：「已下载」必须按 slug 对齐。
 // 真实事故（2026-09-19）：搜索结果 hit.id 是 Algolia objectID（3292），
 // 素材库 id 是 ted:<videoData.id>（66），按 id 对齐永远标不上「已下载」。

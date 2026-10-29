@@ -920,6 +920,9 @@ export class PracticePanel {
       case 'ready':
         trace('[LT-TRACE] webview ready，回推素材');
         this.pushConfig();
+        // ⚠️ 必须先推收藏再推素材：页面的已收藏标记完全依赖 state.favorites，
+        //    只推素材的话首屏标记是空的，用户得先进一次「收藏」视图才看得到。
+        this.pushFavorites();
         this.pushMaterial();
         break;
 
@@ -965,7 +968,7 @@ export class PracticePanel {
               this.favs.setTranslation(saved.id, entry.translation);
               this.favs.setPhonetic(saved.id, entry.phonetic);
               this.pushFavorites();
-              this.webview.postMessage({ type: 'favAdded', deduped });
+              this.webview.postMessage({ type: 'favAdded', deduped, fav: saved });
               break;
             }
           }
@@ -974,7 +977,7 @@ export class PracticePanel {
           }
         }
         this.pushFavorites();
-        this.webview.postMessage({ type: 'favAdded', deduped });
+        this.webview.postMessage({ type: 'favAdded', deduped, fav: saved });
         break;
       }
 
@@ -1942,6 +1945,12 @@ export class PracticePanel {
     --ok: #4ec9b0;
     --err: #f48771;
     --warn: #dcdcaa;
+    /* 已收藏标记：只改文字颜色，不铺任何背景。
+       charts-* 是 VS Code 按主题给出的图表色（浅色主题是加深版，深色主题是提亮版），
+       取不到时用两套主题都能读的中间值兜底。 */
+    --fav-word: var(--vscode-charts-yellow, #b58900);
+    --fav-phrase: var(--vscode-charts-blue, #3794ff);
+    --fav-sentence: var(--vscode-charts-green, #3fa66a);
   }
   * { box-sizing: border-box; }
   /* ⚠️ 页面本身【永不滚动】：滚动只发生在各视图内部（.list / .discover / .library）。
@@ -2013,6 +2022,18 @@ export class PracticePanel {
   .item.active { background: var(--vscode-list-activeSelectionBackground); border-left-color: var(--ok); }
   .item .idx { color: var(--muted); font-size: 11px; min-width: 26px; }
   .item .txt { flex: 1; line-height: 1.4; }
+  /* 字幕列表里的已收藏标记：语义与答案面板一致（黄=单词 / 蓝=短语 / 绿=整句），
+   * 但【不加 cursor:pointer】—— 整行是一个点击区，逐词看起来可点会误导。
+   * ⚠️ skip-ink 必须关掉：默认 auto 会在 g / y / p / q 的下伸部把下划线断开，
+   *    列表字号小、线又贴着基线，看起来就像「下划线坏了」（答案面板偏移 3px
+   *    刚好绕过下伸部，所以那边看着正常）。 */
+  .lmark { text-decoration: underline; text-underline-offset: 3px; text-decoration-skip-ink: none; }
+  .lmark.fw { color: var(--fav-word); text-decoration-thickness: 1px; }
+  .lmark.fp { color: var(--fav-phrase); text-decoration-thickness: 2px; }
+  .lmark.fs { text-decoration: underline wavy; text-decoration-thickness: 1px; }
+  .item.fav-sentence .txt { color: var(--fav-sentence); }
+  /* 当前行不再叠 filter：inline 元素单独合成会让下划线糊/错位，
+   * 颜色直接保留（charts 色在深色选中底上可读）。 */
 
   /* 右：练习区。
      min-height: 0 必须有：flex 子项默认 min-height:auto，会被内容撑到超过
@@ -2059,7 +2080,35 @@ export class PracticePanel {
    * token = 英文答案按词切开的可点击片段；选中高亮，相邻词可扩展成短语 */
   .tok { cursor: pointer; border-radius: 3px; padding: 0 1px; }
   .tok:hover { background: rgba(128,128,128,.18); }
-  .tok.sel { background: var(--accent); color: #fff; }
+  /* 已收藏标记只改文字色 + 下划线：不铺底色、不加边框，盒模型与行高完全不变。
+   * ⚠️ 必须排在 .tok.sel 之前 —— 同权重靠后覆盖，选中态要压过收藏标记。
+   * ⚠️ 整句标记也逐 token 打 class：text-decoration 会向下传播且子元素无法取消，
+   *    挂在 .ans-line 上会让「选中态」也拖着一条波浪线。 */
+  .tok.fav-word {
+    color: var(--fav-word);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+  .tok.fav-phrase {
+    color: var(--fav-phrase);
+    text-decoration: underline;
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
+  }
+  /* 整句里没被单词/短语单独命中的词：只加波浪线，颜色继承 .ans-line */
+  .tok.fav-sentence {
+    text-decoration: underline wavy;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 4px;
+  }
+  /* 答案正文容器：整句收藏只在这层染绿，标点与空格跟着变色 */
+  .ans-line { line-height: 1.6; }
+  .ans-line.fav-sentence { color: var(--fav-sentence); }
+  /* 与字幕列表同一处理：下划线在 g / y / p / q 处不再断开，保证一条线到底 */
+  .tok.fav-word, .tok.fav-phrase, .tok.fav-sentence,
+  .lmark { text-decoration-skip-ink: none; }
+  .tok.sel { background: var(--accent); color: #fff; text-decoration: none; }
   .fav-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
   /* 收藏按钮是答案面板内的轻量操作，比全局按钮（12px）再小一号 */
   .fav-bar button { padding: 2px 8px; font-size: 11px; flex: 0 0 auto; }
@@ -2591,8 +2640,21 @@ window.addEventListener('message', (e) => {
     else if (currentView === 'practice') render();
   }
   // 收藏成功回执：清选区 + 轻提示 + 刷新按钮二态
+  // ⚠️ 回执里带宿主保存后的权威条目，直接 upsert 进本地列表：
+  //    不等下一次 favList 就能上色；favList 万一丢失/滞后，也不会出现
+  //    「明明收藏成功、界面上却永远没有标记」。
   if (msg.type === 'favAdded') {
     state.favSel = [];
+    const added = msg.fav;
+    if (added && added.id && added.type && added.text) {
+      const addedKey = added.type + ':' + String(added.text).toLowerCase();
+      const at = state.favorites.findIndex(
+        (f) => f.id === added.id || f.type + ':' + String(f.text).toLowerCase() === addedKey
+      );
+      state.favorites = at >= 0
+        ? state.favorites.slice(0, at).concat([added], state.favorites.slice(at + 1))
+        : state.favorites.concat([added]);
+    }
     showNotice(msg.deduped ? '已在收藏中，来源句已更新' : '已收藏');
     if (currentView === 'favorites') renderFavView();
     else if (currentView === 'practice') render();
@@ -4191,9 +4253,12 @@ function renderList() {
     const tMark = s.timingEdited
       ? '<span class="t-mark" title="这一句的时间轴被手工修正过">✎</span>'
       : '';
-    return '<div class="item' + (i === state.currentIndex ? ' active' : '') + '" data-i="' + i + '">' +
+    // 已收藏标记：只把命中的词包一层 span（不新增可点区域），整句命中时整行加 class
+    const favRes = favMarksOf(s.text);
+    return '<div class="item' + (i === state.currentIndex ? ' active' : '') +
+      (favRes.sentFav ? ' fav-sentence' : '') + '" data-i="' + i + '">' +
       '<span class="idx">' + (i + 1) + '</span>' +
-      '<span class="txt">' + esc(s.text) + tMark + '</span>' +
+      '<span class="txt">' + renderListText(s.text) + tMark + '</span>' +
       '<span class="idx">' + mark + '</span>' +
     '</div>';
   }).join('');
@@ -4335,25 +4400,213 @@ function answerTokens(text) {
   return text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
 }
 
+/* ---------------- 已收藏标记（单词 / 短语 / 整句） ----------------
+ *
+ * 收藏数据是【全局】的：按 type + 小写文本去重（core/favorites.ts），不绑文章。
+ * 所以在 A 篇收藏的词，在 B 篇同样命中 —— 这是「生词标记」，不是「文章标记」。
+ *
+ * 性能：索引只在 favorites 数组身份变化时重建，单句命中按句文本缓存。
+ * render() 每次点词都会整体重建 DOM，若每次都对 130+ 句重算短语匹配，
+ * 收藏一多，点一下就会明显卡。（实测 1000 条收藏 × 137 句约几十毫秒，够感知）
+ */
+
+/** 归一化词条：小写 + 空白折叠。收藏文本与选区文本同源（token 用单空格 join），只差大小写 */
+function favKey(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 选词/整句比较键：只保留英文词（标点、大小写、空白差异都不算差异）。
+ * ⚠️ 整句收藏存的是【带标点的原句】（"… the hills."），而选区是 token 用空格
+ *    join 出来的（"… the hills"，没有句号）。直接比 favKey 永远不相等 ——
+ *    表现就是「句子明明收藏了，选中整句后按钮却还是『收藏所选』」。
+ */
+function favWordKey(text) {
+  return answerTokens(text).join(' ').toLowerCase();
+}
+
+/** 收藏索引：单词/整句用 Set，短语按【首词】建 Map（逐 token 只查一次） */
+let favIndex = { list: null, map: null };
+
+function favMarkMap() {
+  if (favIndex.list === state.favorites && favIndex.map) return favIndex.map;
+  const words = new Set();
+  const sentences = new Set();
+  const phrases = new Map();
+  for (const f of state.favorites) {
+    const key = favKey(f.text);
+    if (!key) continue;
+    if (f.type === 'word') {
+      // 用 token 键：历史数据里若混进标点（"hills."）也能对上句子里的 hills
+      words.add(favWordKey(f.text) || key);
+    } else if (f.type === 'sentence') {
+      sentences.add(key);
+      // 同一句只是标点不同也要能命中：选区比对用的是 token 键（见 favWordKey）
+      const wordKey = favWordKey(f.text);
+      if (wordKey) sentences.add(wordKey);
+    } else if (f.type === 'phrase') {
+      // 按 token 序列切，而不是 split(' ')：历史数据里存了标点或多余空白也能对齐
+      const arr = answerTokens(f.text).map((t) => t.toLowerCase());
+      if (!arr.length) continue;
+      if (!phrases.has(arr[0])) phrases.set(arr[0], []);
+      phrases.get(arr[0]).push({ words: arr, fav: f });
+    }
+  }
+  favIndex = { list: state.favorites, map: { words, sentences, phrases } };
+  return favIndex.map;
+}
+
+/** 单句命中缓存：键 = 句文本（同素材内重复句结果一致），随收藏/素材变化失效 */
+let favHits = { list: null, material: null, byText: new Map() };
+
+/**
+ * 算出一句话里每个 token 的收藏命中级别。
+ * 返回 { marks, spans, sentFav }：
+ *   marks[i] = 'w' 单词命中 / 'p' 短语命中 / '' 无
+ *   spans    = [{ start, end, fav }]（短语区间，闭区间）
+ *   sentFav  = 整句收藏条目（没有则 null）
+ */
+function favMarksOf(text) {
+  // 用素材【对象身份】而不是 id 做键：同 id 重新下发（字幕修正）时缓存也要失效
+  const mat = state.material;
+  if (favHits.list !== state.favorites || favHits.material !== mat) {
+    favHits = { list: state.favorites, material: mat, byText: new Map() };
+  }
+  if (favHits.byText.has(text)) return favHits.byText.get(text);
+
+  const map = favMarkMap();
+  const toks = answerTokens(text);
+  const lower = toks.map((t) => t.toLowerCase());
+  const marks = new Array(toks.length).fill('');
+  const spans = [];
+
+  // 整句：全文本一致，或「只差标点」的 token 序列一致（跨文章也要同一句，实际很少）
+  let sentFav = null;
+  const sentKey = favKey(text);
+  const sentWordKey = lower.join(' ');
+  if (map.sentences.has(sentKey) || (sentWordKey && map.sentences.has(sentWordKey))) {
+    sentFav = state.favorites.find(
+      (f) => f.type === 'sentence' &&
+        (favKey(f.text) === sentKey ||
+         (!!sentWordKey && favWordKey(f.text) === sentWordKey))
+    ) || null;
+  }
+
+  // 单词：同形词在一句里出现几次就标几次（文本级收藏没有位置信息）
+  for (let i = 0; i < lower.length; i++) {
+    if (map.words.has(lower[i])) marks[i] = 'w';
+  }
+
+  // 短语：按首词取候选，再逐词比对 token 序列。
+  // ⚠️ 不能用 indexOf / includes —— 收藏 "to be" 会误命中 "to become"。
+  for (let i = 0; i < lower.length; i++) {
+    const cand = map.phrases.get(lower[i]);
+    if (!cand) continue;
+    for (const p of cand) {
+      const n = p.words.length;
+      if (i + n > lower.length) continue;
+      let ok = true;
+      for (let k = 1; k < n; k++) {
+        if (lower[i + k] !== p.words[k]) { ok = false; break; }
+      }
+      if (!ok) continue;
+      for (let k = i; k < i + n; k++) marks[k] = 'p';
+      spans.push({ start: i, end: i + n - 1, fav: p.fav });
+    }
+  }
+
+  // 整句命中：剩下没被单词/短语单独命中的词统一标 's'（绿色由 .ans-line 继承）。
+  // 在这里一次性填好，两个渲染函数就不用各自再写一遍 fallback。
+  if (sentFav) {
+    for (let i = 0; i < marks.length; i++) if (!marks[i]) marks[i] = 's';
+  }
+
+  const res = { marks, spans, sentFav };
+  favHits.byText.set(text, res);
+  return res;
+}
+
+/**
+ * 覆盖某个 token 的收藏单元（用于「整块锁定」）。
+ * 取跨度【最小】的：短语优先于整句 —— 这样整句里收藏的短语仍能单独取消。
+ * 无命中返回 null（走普通选区逻辑）。
+ */
+function favUnitAt(res, wi) {
+  if (!res.marks.length) return null;
+  const whole = res.sentFav
+    ? { start: 0, end: res.marks.length - 1, fav: res.sentFav }
+    : null;
+  let best = null;
+  for (const sp of res.spans) {
+    if (wi < sp.start || wi > sp.end) continue;
+    if (!best || (sp.end - sp.start) < (best.end - best.start)) best = sp;
+  }
+  // 短语必须【严格更短】才算更具体的单元：与整句同跨度时按整句处理。
+  // 否则会锁到短语选区、而按钮按「选区覆盖整句」判成整句，取消目标对不上。
+  if (whole && (!best || (best.end - best.start) >= whole.end - whole.start)) return whole;
+  return best || whole;
+}
+
 /**
  * 答案渲染成「词 token + 原样分隔符」：
  * 单词包 <span class="tok">，点击收藏；分隔符保持原样转义输出。
  * 选区归属句号（favSelFor）不是当前句时不高亮 —— 切句后旧选区自动失效。
+ * 收藏命中只给已有的词 span 追加 class；整句颜色由外层 .ans-line 负责。
  */
 function renderAnswerTokens(text) {
   const words = text.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) || [];
   const sel = state.favSelFor === state.currentIndex ? state.favSel : [];
+  const res = favMarksOf(text);
   const re = /[A-Za-z]+(?:['’-][A-Za-z]+)*/g;
   let out = '', last = 0, wi = 0, m;
   while ((m = re.exec(text)) !== null) {
     out += esc(text.slice(last, m.index));
+    // mk = 'w' 单词 / 'p' 短语 / 's' 整句（只加波浪线，绿色由 .ans-line 继承）
+    const mk = res.marks[wi];
     out += '<span class="tok' + (sel.indexOf(wi) >= 0 ? ' sel' : '') +
+      (mk === 'w' ? ' fav-word' : mk === 'p' ? ' fav-phrase' : mk === 's' ? ' fav-sentence' : '') +
       '" data-tok="' + wi + '">' + esc(m[0]) + '</span>';
     wi++;
     last = m.index + m[0].length;
   }
   out += esc(text.slice(last));
   return out;
+}
+
+/**
+ * 字幕列表用：只把命中的词包一层标记，不绑定点击（整行才是点击区）。
+ * 连续同级别的词（中间只隔空白）合并成一个 span —— 短语/整句的下划线才连成
+ * 一条线，而不是「每个词各一小段」。答案面板不能这么做：那里每个 token 都要
+ * 独立可点，所以只有列表走这个渲染。
+ */
+function renderListText(text) {
+  const res = favMarksOf(text);
+  const re = /[A-Za-z]+(?:['’-][A-Za-z]+)*/g;
+  const toks = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    toks.push({ start: m.index, end: m.index + m[0].length });
+  }
+  let out = '', last = 0, wi = 0;
+  while (wi < toks.length) {
+    const mk = res.marks[wi];
+    if (!mk) {
+      out += esc(text.slice(last, toks[wi].end));
+      last = toks[wi].end;
+      wi++;
+      continue;
+    }
+    // 往后吞掉「同级别、且中间只有空白」的相邻词（有标点就断开）
+    let j = wi;
+    while (j + 1 < toks.length && res.marks[j + 1] === mk &&
+      /^\s+$/.test(text.slice(toks[j].end, toks[j + 1].start))) j++;
+    out += esc(text.slice(last, toks[wi].start)) +
+      '<span class="lmark f' + mk + '">' +
+      esc(text.slice(toks[wi].start, toks[j].end)) + '</span>';
+    last = toks[j].end;
+    wi = j + 1;
+  }
+  return out + esc(text.slice(last));
 }
 
 function renderPractice() {
@@ -4376,14 +4629,27 @@ function renderPractice() {
   const r = state.results[i];
   const p = document.getElementById('practice');
 
+  // 收藏命中索引（带缓存）：单词/短语/整句的收藏状态全在这里，渲染时只查表
+  const favRes = favMarksOf(s.text);
   // 选区文本（选区归属当前句才有效），供「收藏所选」按钮展示与提交
   const selActive = state.favSelFor === i && state.favSel.length > 0;
   const selWords = answerTokens(s.text);
   const selText = selActive ? state.favSel.map((k) => selWords[k]).join(' ') : '';
   // 当前句是否已收藏（整句）。收藏去重键 = type+text（忽略大小写），对齐宿主
-  const sentFav = state.favorites.find(
-    (f) => f.type === 'sentence' && f.text.toLowerCase() === s.text.toLowerCase()
-  );
+  const sentFav = favRes.sentFav;
+  // 选区是否覆盖整句：全覆盖时优先按「整句」比对，避免把整句当成短语取消
+  const selWhole = selActive && selWords.length > 0 &&
+    state.favSel.length === selWords.length && state.favSel[0] === 0;
+  const selKey = selActive ? favWordKey(selText) : '';
+  // 选区恰好等于一条已收藏条目（整句 / 短语 / 单词）→ 按钮变「取消收藏」。
+  // ⚠️ 必须用 favWordKey：整句收藏带标点、选区不带，直接比 favKey 永远不相等。
+  const selFav = !selActive ? null
+    : ((selWhole
+        ? state.favorites.find((f) => f.type === 'sentence' && favWordKey(f.text) === selKey)
+        : null) ||
+       state.favorites.find((f) =>
+         f.type === (state.favSel.length > 1 ? 'phrase' : 'word') &&
+         favWordKey(f.text) === selKey));
 
   let diffHtml = '';
   if (r) {
@@ -4451,7 +4717,9 @@ function renderPractice() {
     '<div class="answer" id="answerBox" style="display:' +
       (state.revealAnswer ? 'block' : 'none') + '">' +
       '<div class="lbl">标准答案（点击单词可选中，再点相邻词扩展成短语）</div>' +
-      renderAnswerTokens(s.text) +
+      // 整句命中只给这层染绿（标点与空格跟着变），token 上的单词/短语标记再覆盖它
+      '<div class="ans-line' + (sentFav ? ' fav-sentence' : '') + '">' +
+        renderAnswerTokens(s.text) + '</div>' +
       '<div class="fav-bar">' +
         // 有选区时只显示「收藏所选」（收藏整句隐藏）；无选区时只显示收藏整句
         // 整句收藏二态：已收藏显示「已收藏」，再点取消收藏
@@ -4459,7 +4727,12 @@ function renderPractice() {
           ? '<button id="favSentence" class="ghost">' +
             (sentFav ? '✓ 已收藏整句（点击取消）' : '⭐ 收藏整句') + '</button>'
           : '<span class="sel-text">已选「' + esc(selText) + '」</span>' +
-            '<button id="favSelAdd" class="ghost">⭐ 收藏所选</button>' +
+            // 选区已是收藏条目 → 二态成「取消收藏」（整句 / 短语 / 单词各自措辞）
+            (selFav
+              ? '<button id="favSelRemove" class="ghost">' +
+                (selFav.type === 'sentence'
+                  ? '✓ 已收藏整句（点击取消）' : '✓ 已收藏（点击取消）') + '</button>'
+              : '<button id="favSelAdd" class="ghost">⭐ 收藏所选</button>') +
             '<button id="favSelClear" class="ghost">取消选择</button>') +
       '</div>' +
       (s.translation ? '<div class="lbl" style="margin-top:8px">译文</div>' + esc(s.translation) : '') +
@@ -4509,10 +4782,31 @@ function renderPractice() {
   /* ---- 答案面板点选收藏 ---- */
   // 点词：首次选中；点相邻词扩展成短语；点不相邻词重置为新选择；
   // 再点已选中的唯一单词取消。选区只对当前句有效（favSelFor 锁句号）。
+  // 例外：点在已收藏的短语/整句里 → 整块选中，只能整体取消（见 favUnitAt）。
   document.querySelectorAll('#answerBox .tok').forEach((el) => {
     el.onclick = () => {
       const wi = Number(el.dataset.tok);
       if (state.favSelFor !== i) { state.favSelFor = i; state.favSel = []; }
+
+      // ① 点在已收藏的短语 / 整句里 → 整块锁定：只能整体取消，不能拆成单词再收藏。
+      //    favUnitAt 取跨度最小的单元：短语优先于整句，整句里的短语因此仍能单独取消。
+      const unit = favUnitAt(favRes, wi);
+      if (unit) {
+        const same = state.favSel.length === unit.end - unit.start + 1 &&
+          state.favSel[0] === unit.start;
+        if (same) {
+          state.favSel = [];
+          state.favSelFor = -1;
+        } else {
+          state.favSel = [];
+          for (let k = unit.start; k <= unit.end; k++) state.favSel.push(k);
+          state.favSelFor = i;
+        }
+        render();
+        return;
+      }
+
+      // ② 普通选区：首次选中 / 相邻扩展 / 不相邻重置 / 再点取消
       const sel = state.favSel;
       if (sel.indexOf(wi) >= 0) {
         // 再点已选中的词 → 取消该词；一个不剩就回到初始状态
@@ -4545,6 +4839,17 @@ function renderPractice() {
         fav: { type: state.favSel.length > 1 ? 'phrase' : 'word', text, context: favContext() },
       });
       state.favSel = [];
+      render();
+    };
+  }
+  const favSelRemove = document.getElementById('favSelRemove');
+  if (favSelRemove && selFav) {
+    favSelRemove.onclick = () => {
+      // 与整句取消同一条通道：本地先移除让标记/按钮立即翻转，宿主回推 favList 再对账
+      vscode.postMessage({ type: 'favRemove', id: selFav.id });
+      state.favorites = state.favorites.filter((f) => f.id !== selFav.id);
+      state.favSel = [];
+      state.favSelFor = -1;
       render();
     };
   }
