@@ -2414,35 +2414,46 @@ export class PracticePanel {
   .lib-filters button { padding: 2px 7px; font-size: 11px; }
   .lib-filters button.on { color: var(--accent); border-color: var(--accent); }
 
-  /* ---- 素材卡片 ----
-   * 左侧 3px 竖条 = 难度（未评级不显示），已学完整卡降一档透明度、悬停恢复。 */
+  /* ---- 卡片盒子：【素材库与收藏视图共用】 ----
+   * ⚠️ 这里只放两者都需要的盒子样式，**不要加 display:flex**。
+   *    收藏视图的卡片也是 .lib-card，内部是「标题 + 若干 .meta」的竖排块；
+   *    一旦把 .lib-card 变成 flex 容器，那些块会变成并排的 flex 子项，
+   *    整张卡被压成一坨（0.1.5 真实事故）。
+   *    素材库那套「横排 + 难度竖条」一律挂在 .lib-mat 上。 */
   .lib-card {
-    position: relative; display: flex; gap: 8px; align-items: flex-start;
-    padding: 8px 8px 8px 10px; margin-bottom: 6px;
-    border: 1px solid var(--border); border-left: 3px solid transparent;
-    border-radius: 4px; cursor: pointer;
+    padding: 8px; margin-bottom: 6px;
+    border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
   }
   .lib-card:hover { border-color: var(--accent); }
-  .lib-card[data-diff="easy"] { border-left-color: var(--ok); }
-  .lib-card[data-diff="medium"] { border-left-color: var(--warn); }
-  .lib-card[data-diff="hard"] { border-left-color: var(--err); }
-  .lib-card.learned { opacity: .68; }
-  .lib-card.learned:hover { opacity: 1; }
-  /* 被自己改动而不再符合当前筛选：先留在原地并标黄，下次换条件才移出 */
-  .lib-card.stale { box-shadow: inset 0 0 0 1px var(--warn); }
-  .lib-card.stale .lib-stale { color: var(--warn); }
-  .lib-body { flex: 1 1 auto; min-width: 0; }
   .lib-card .t {
     font-weight: 600; font-size: 12px; line-height: 1.35;
     display: -webkit-box; -webkit-line-clamp: 2;
     -webkit-box-orient: vertical; overflow: hidden;
   }
-  /* 信息行：名字 · 句数 · 时长 · 加入时间，必须同一行 —— 窄了省略，不折行 */
-  .lib-card .meta {
-    margin-top: 3px; color: var(--muted); font-size: 11px;
-    padding: 0; border: none;
+  .lib-card .meta { margin-top: 4px; color: var(--muted); font-size: 11px; padding: 0; border: none; }
+
+  /* ---- 素材库卡片（.lib-mat）：横排 + 左侧难度竖条 ----
+   * 左侧 3px 竖条 = 难度（未评级不显示），已学完整卡降一档透明度、悬停恢复。 */
+  .lib-mat {
+    position: relative; display: flex; gap: 8px; align-items: flex-start;
+    padding: 8px 8px 8px 10px;
+    border-left: 3px solid transparent;
+  }
+  .lib-mat[data-diff="easy"] { border-left-color: var(--ok); }
+  .lib-mat[data-diff="medium"] { border-left-color: var(--warn); }
+  .lib-mat[data-diff="hard"] { border-left-color: var(--err); }
+  .lib-mat.learned { opacity: .68; }
+  .lib-mat.learned:hover { opacity: 1; }
+  /* 被自己改动而不再符合当前筛选：先留在原地并标黄，下次换条件才移出 */
+  .lib-mat.stale { box-shadow: inset 0 0 0 1px var(--warn); }
+  .lib-mat.stale .lib-stale { color: var(--warn); }
+  /* 信息行：名字 · 句数 · 时长 · 加入时间，必须同一行 —— 窄了省略，不折行
+     （只对素材库生效：收藏视图的 .meta 里是例句译文，截断就看不全了） */
+  .lib-mat .meta {
+    margin-top: 3px;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
+  .lib-body { flex: 1 1 auto; min-width: 0; }
   /* 徽标单独一行（音频就绪 / 难度 / 已学完） */
   .lib-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 4px; }
   .badge {
@@ -2533,11 +2544,9 @@ export class PracticePanel {
   .t-row button { flex: 0 0 auto; padding: 2px 6px; font-size: 11px; line-height: 1.5; }
   .t-lbl { min-width: 26px; color: var(--muted); font-size: 11px; }
   .t-mark { color: var(--accent); font-size: 10px; margin-left: 4px; }
-  /* 多选选中态：只画上右下三条边，左侧留给难度竖条 */
-  .lib-card.selected {
-    border-top-color: var(--accent); border-right-color: var(--accent);
-    border-bottom-color: var(--accent); background: rgba(128,128,128,.08);
-  }
+  .lib-card.selected { border-color: var(--accent); background: rgba(128,128,128,.08); }
+  /* 卡片内的竖排块要能收缩：否则长标题会把卡片撑出容器（原规则，勿删） */
+  .lib-card > div { flex: 1 1 auto; min-width: 0; }
   /* 「⋯」更多操作：删除等破坏性入口收进菜单，卡片左侧留给多选标记 */
   .lib-more {
     flex: 0 0 auto; padding: 0 6px; line-height: 20px;
@@ -4656,7 +4665,7 @@ function renderLib() {
     metaBits.push(it.sentenceCount + ' 句');
     metaBits.push(fmtTime(it.durationMs));
     metaBits.push('加入 ' + fmtDate(it.addedAt));
-    return '<div class="lib-card' + (libState.selected[it.dirName] ? ' selected' : '') +
+    return '<div class="lib-card lib-mat' + (libState.selected[it.dirName] ? ' selected' : '') +
         (it.learned ? ' learned' : '') + (stale ? ' stale' : '') +
         '" data-dirname="' + esc(it.dirName) + '" data-diff="' + esc(diff) + '">' +
       lead +

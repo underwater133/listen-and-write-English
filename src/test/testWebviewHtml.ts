@@ -1423,16 +1423,38 @@ check(
 // 卡片版式（用户明确要求）：信息行 = 名字 · 句数 · 时长 · 加入时间，且必须一行；
 // 三个徽标另起一行。混在一起时窄面板会把日期挤到第二行，看起来像两块信息。
 check(
-  'panel.ts: 卡片信息行顺序 = 名字 → 句数 → 时长 → 加入时间（锁死单行）',
+  'panel.ts: 卡片信息行顺序 = 名字 → 句数 → 时长 → 加入时间（单行）',
   /if \(it\.presenter\) metaBits\.push[\s\S]{0,200}'加入 ' \+ fmtDate\(it\.addedAt\)/.test(panelCode) &&
     /metaBits\.join\(' · '\)/.test(panelCode) &&
-    /\.lib-card \.meta \{[\s\S]{0,180}white-space: nowrap/.test(panelCode),
+    /\.lib-mat \.meta \{[\s\S]{0,180}white-space: nowrap/.test(panelCode),
   '信息行顺序不对，或没有锁死单行（窄了就折行）'
 );
 check(
   'panel.ts: 三个徽标单独一行（不与信息行混排）',
   /class="lib-tags"/.test(panelCode) && /\.lib-tags \{[\s\S]{0,140}flex-wrap: wrap/.test(panelCode),
   '徽标混进信息行会把日期挤到第二行'
+);
+/* ⚠️ 回归防护（0.1.5 真实事故）：收藏视图的卡片同样是 .lib-card。
+ * 把「横排 + 省略」这套素材库专属样式直接写在 .lib-card 上，
+ * 收藏卡里的每个 .meta 就变成了并排的 flex 子项 —— 整张卡被压成一坨，
+ * 例句/译文全被 ellipsis 截断。素材库样式必须挂在 .lib-mat 上。 */
+check(
+  'panel.ts: .lib-card 不带 display:flex（收藏视图共用，加了就压成一坨）',
+  /\.lib-card \{[^}]*display:\s*flex/.test(panelCode) === false,
+  '把横排版式写到了共用的 .lib-card 上，收藏视图会被一起改坏'
+);
+check(
+  'panel.ts: 素材库卡片用 .lib-mat 承载横排与难度竖条',
+  /\.lib-mat \{[^}]*display:\s*flex/.test(panelCode) &&
+    /class="lib-card lib-mat/.test(panelCode) &&
+    /\.lib-mat\[data-diff="easy"\]/.test(panelCode),
+  '素材库没走 .lib-mat，收藏视图的样式就会被牵连'
+);
+check(
+  'panel.ts: 收藏视图的 .meta 不被锁成单行（例句译文要能折行）',
+  /\.lib-mat \.meta \{/.test(panelCode) &&
+    !/\.lib-card \.meta \{[^}]*nowrap/.test(panelCode),
+  '把 nowrap 写在共用的 .lib-card .meta 上，收藏卡片的译文会被截断'
 );
 
 /* ---------- 结果 ---------- */
