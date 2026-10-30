@@ -33,6 +33,12 @@ import {
   setTimingOverride,
   SentenceTiming,
 } from '../core/timing';
+import {
+  MaterialDifficulty,
+  isMaterialDifficulty,
+  readMaterialFlags,
+  writeMaterialFlags,
+} from '../core/materialFlags';
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
 import { getDictionary } from '../core/dictionary';
@@ -92,9 +98,21 @@ export interface CachedMaterial {
    */
   slug: string;
   title: string;
+  /**
+   * 演讲者。素材库的「搜索」要按作者过滤，而 manifest 里本来就有这个字段
+   * （ListeningMaterial.presenter），此前只是没传到页面。
+   */
+  presenter: string;
   sentenceCount: number;
   hasAudio: boolean;
   durationMs: number;
+  /** 加入时间（= manifest 的 fetchedAt；老素材缺失时退回 material.json 的 mtime） */
+  addedAt: number;
+  /** 已学完（learn.json 覆盖层，见 core/materialFlags.ts） */
+  learned: boolean;
+  /** 难度；null = 未评级 */
+  difficulty: MaterialDifficulty | null;
+  /** 元数据抓取时间（保留原字段：恢复上次素材、排序都靠它） */
   fetchedAt: number;
 }
 
@@ -869,6 +887,63 @@ export class PracticePanel {
     this.webview.postMessage({ type: 'cachedList', error: null, items: this.scanCached() });
   }
 
+  /**
+   * 设置素材的学习状态（已学完 / 难度），落在素材目录的 learn.json 里。
+   *
+   * ⚠️ 宿主是唯一权威：页面**不做乐观更新**，一律等这条回包再改界面 ——
+   *    否则会出现「界面显示已学完、磁盘上什么都没写」的假成功。
+   *    写盘失败必须回包带 error，页面据此提示并保持原状。
+   */
+  private setMaterialFlags(
+    dirName: string,
+    patch: { learned?: boolean; difficulty?: unknown }
+  ): void {
+    // 与删除同一套判据：不能信任 webview 传来的目录名
+    if (!dirName || /[\\/:*?"<>|]/.test(dirName)) {
+      this.webview.postMessage({ type: 'materialFlags', dirName, error: '素材目录名非法' });
+      return;
+    }
+    const dir = path.join(this.deps.cacheRoot, dirName);
+    if (!fs.existsSync(dir)) {
+      this.webview.postMessage({
+        type: 'materialFlags',
+        dirName,
+        error: '素材目录不存在（可能已被删除）',
+      });
+      return;
+    }
+
+    const cur = readMaterialFlags(dir);
+    // 难度只接受白名单值：显式 null = 清除难度，undefined = 保持不变，非法值一律忽略
+    let difficulty = cur.difficulty;
+    if (patch.difficulty === null) difficulty = null;
+    else if (isMaterialDifficulty(patch.difficulty)) difficulty = patch.difficulty;
+
+    const next = {
+      learned: typeof patch.learned === 'boolean' ? patch.learned : cur.learned,
+      difficulty,
+      updatedAt: Date.now(),
+    };
+
+    try {
+      writeMaterialFlags(dir, next);
+    } catch (e: any) {
+      this.webview.postMessage({
+        type: 'materialFlags',
+        dirName,
+        error: String(e?.message ?? e),
+      });
+      return;
+    }
+
+    this.webview.postMessage({
+      type: 'materialFlags',
+      dirName,
+      learned: next.learned,
+      difficulty: next.difficulty,
+    });
+  }
+
   private scanCached(): CachedMaterial[] {
     if (!fs.existsSync(this.deps.cacheRoot)) return [];
     const out: CachedMaterial[] = [];
@@ -889,6 +964,17 @@ export class PracticePanel {
             durationMs = info.durationMs ?? 0;
           }
         }
+        // 加入时间：manifest 的 fetchedAt 缺失时退回文件 mtime ——
+        // 旧素材（fetchedAt 加入之前生成的）不该在列表里显示成「未知」
+        let addedAt = Number(m.fetchedAt) || 0;
+        if (!addedAt) {
+          try {
+            addedAt = fs.statSync(metaPath).mtimeMs;
+          } catch {
+            /* 取不到就保持 0，界面按「未知」显示 */
+          }
+        }
+        const flags = readMaterialFlags(dir);
         out.push({
           id: m.id,
           // ⚠️ 恢复素材必须用目录名，不能用 m.id（id 里可能含冒号等
@@ -896,16 +982,22 @@ export class PracticePanel {
           dirName: d.name,
           slug: slugFromUrl(m.sourceUrl),
           title: m.title || m.id,
+          presenter: m.presenter || '',
           sentenceCount: m.sentences?.length ?? 0,
           hasAudio,
           durationMs,
+          addedAt,
+          learned: flags.learned,
+          difficulty: flags.difficulty,
           fetchedAt: m.fetchedAt ?? 0,
         });
       } catch {
         /* 跳过损坏素材 */
       }
     }
-    out.sort((a, b) => b.fetchedAt - a.fetchedAt);
+    // 按「加入时间」倒序 —— 与列表上显示的那一列同一口径，
+    // 否则旧素材（fetchedAt 缺失、退回 mtime）会显示一个近期日期却排在最后
+    out.sort((a, b) => b.addedAt - a.addedAt || b.fetchedAt - a.fetchedAt);
     return out;
   }
 
@@ -1395,6 +1487,15 @@ export class PracticePanel {
         break;
       }
 
+      // 素材库 / 精听页：标记已学完、设置难度
+      case 'setMaterialFlags': {
+        this.setMaterialFlags(String(msg.dirName ?? ''), {
+          learned: typeof msg.learned === 'boolean' ? msg.learned : undefined,
+          difficulty: 'difficulty' in msg ? msg.difficulty : undefined,
+        });
+        break;
+      }
+
       /**
        * 「发现 TED」卡片展开时取简介。
        *
@@ -1824,12 +1925,24 @@ export class PracticePanel {
       '  (v3 起应为 m4a/MP4；aac=裸 ADTS 在 VS Code 里播不了)');
     trace('[LT-TRACE]   timing    = ' + timingCount + ' 句有手工修正');
 
+    /**
+     * 素材标记（已学完 / 难度）。
+     * 精听页标题下方那一行要用它，而 ListeningMaterial 本身不带这两个字段
+     * —— 它们是 learn.json 覆盖层，只在推送时合并（同 timing 的处理方式）。
+     */
+    const dirName = this.material.cacheDir ? path.basename(this.material.cacheDir) : '';
+    const flags = dirName ? readMaterialFlags(this.material.cacheDir) : null;
+
     this.webview.postMessage({
       type: 'material',
       material: {
         id: this.material.id,
         title: this.material.title,
         presenter: this.material.presenter,
+        // 标记行的落点：没有目录名（未下载到素材库）时页面整行隐藏
+        dirName: dirName,
+        learned: flags ? flags.learned : false,
+        difficulty: flags ? flags.difficulty : null,
         // 收藏「跳回原句」靠它解析 slug → 素材目录；缺失会让 dirName 永远为空
         sourceUrl: this.material.sourceUrl || '',
         sentences: sentences,
@@ -2277,24 +2390,103 @@ export class PracticePanel {
    *    "切回练习"都会突然显示那份报告，表现为「界面跳来跳去、跳到诊断报告去了」。 */
   .report-view { display: none; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 10px; gap: 8px; }
   .report-view.visible { display: flex; }
+
+  /* ---- 素材库：吸顶的搜索 + 两组筛选 ----
+   * top/-10px 与负 margin 成对使用：.library 自身有 10px padding，
+   * 只用 top:0 的话吸顶后上方会留下一条 10px 的缝，卡片会从缝里滚过去。 */
+  .lib-head {
+    position: sticky; top: -10px; z-index: 3;
+    display: flex; flex-direction: column; gap: 4px;
+    margin: -10px -10px 0; padding: 10px 10px 8px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .lib-search { display: flex; gap: 4px; align-items: center; }
+  .lib-search input {
+    flex: 1 1 auto; min-width: 0;
+    padding: 3px 6px; font-size: 11px; font-family: inherit;
+    background: var(--input-bg); color: var(--input-fg);
+    border: 1px solid var(--input-border); border-radius: 3px; outline: none;
+  }
+  .lib-search input:focus { border-color: var(--accent); }
+  .lib-search button { flex: 0 0 auto; padding: 2px 6px; font-size: 11px; }
+  .lib-filters { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .lib-filters .grp { font-size: 10px; color: var(--muted); margin-right: 2px; }
+  .lib-filters button { padding: 2px 7px; font-size: 11px; }
+  .lib-filters button.on { color: var(--accent); border-color: var(--accent); }
+
+  /* ---- 素材卡片 ----
+   * 左侧 3px 竖条 = 难度（未评级不显示），已学完整卡降一档透明度、悬停恢复。 */
   .lib-card {
-    padding: 8px; margin-bottom: 6px;
-    border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+    position: relative; display: flex; gap: 8px; align-items: flex-start;
+    padding: 8px 8px 8px 10px; margin-bottom: 6px;
+    border: 1px solid var(--border); border-left: 3px solid transparent;
+    border-radius: 4px; cursor: pointer;
   }
   .lib-card:hover { border-color: var(--accent); }
+  .lib-card[data-diff="easy"] { border-left-color: var(--ok); }
+  .lib-card[data-diff="medium"] { border-left-color: var(--warn); }
+  .lib-card[data-diff="hard"] { border-left-color: var(--err); }
+  .lib-card.learned { opacity: .68; }
+  .lib-card.learned:hover { opacity: 1; }
+  /* 被自己改动而不再符合当前筛选：先留在原地并标黄，下次换条件才移出 */
+  .lib-card.stale { box-shadow: inset 0 0 0 1px var(--warn); }
+  .lib-card.stale .lib-stale { color: var(--warn); }
+  .lib-body { flex: 1 1 auto; min-width: 0; }
   .lib-card .t {
     font-weight: 600; font-size: 12px; line-height: 1.35;
     display: -webkit-box; -webkit-line-clamp: 2;
     -webkit-box-orient: vertical; overflow: hidden;
   }
-  .lib-card .meta { margin-top: 4px; color: var(--muted); font-size: 11px; padding: 0; border: none; }
+  /* 信息行：名字 · 句数 · 时长 · 加入时间，必须同一行 —— 窄了省略，不折行 */
+  .lib-card .meta {
+    margin-top: 3px; color: var(--muted); font-size: 11px;
+    padding: 0; border: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  /* 徽标单独一行（音频就绪 / 难度 / 已学完） */
+  .lib-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 4px; }
   .badge {
     display: inline-block; padding: 1px 5px;
     margin-left: 4px; border-radius: 8px;
     font-size: 10px; vertical-align: middle;
   }
+  /* 徽标靠 flex gap 排开，取消 .badge 自带的外边距免得间距翻倍 */
+  .lib-tags .badge { margin-left: 0; }
   .badge.ok { color: var(--ok); border: 1px solid currentColor; }
   .badge.no { color: var(--muted); border: 1px dashed currentColor; }
+  .badge.d-easy { color: var(--ok); border: 1px solid currentColor; }
+  .badge.d-medium { color: var(--warn); border: 1px solid currentColor; }
+  .badge.d-hard { color: var(--err); border: 1px solid currentColor; }
+  .badge.d-none { color: var(--muted); border: 1px dashed currentColor; }
+  .d-easy { color: var(--ok); }
+  .d-medium { color: var(--warn); }
+  .d-hard { color: var(--err); }
+
+  /* ---- 素材「⋯」菜单：全局单例、fixed 定位 ----
+   * 卡片在 overflow-y:auto 容器里，卡片内 absolute 的弹层会被容器裁掉，
+   * 滚轮一动还会与卡片错位 —— 所以挂在 body 下、按触发按钮的 rect 定位。 */
+  .lib-menu {
+    display: none; position: fixed; z-index: 50; min-width: 132px;
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.28);
+    padding: 4px; font-size: 11px;
+  }
+  .lib-menu.open { display: block; }
+  .lib-menu .mh { padding: 2px 6px; color: var(--muted); font-size: 10px; }
+  .lib-menu .mi {
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 6px; border-radius: 3px; cursor: pointer; white-space: nowrap;
+  }
+  .lib-menu .mi:hover { background: var(--vscode-list-hoverBackground); }
+  .lib-menu .mi.del { color: var(--err); }
+  .lib-menu .msep { height: 1px; background: var(--border); margin: 4px 2px; }
+  .lib-menu .mi .tick { width: 10px; color: var(--accent); }
+
+  /* 精听页标题下的标记行（难度 + 已学完） */
+  .lib-flags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
+  .lib-flags button { padding: 1px 7px; font-size: 11px; }
+  .lib-flags button.on { color: var(--ok); border-color: var(--ok); }
 
   /* ---- 收藏视图：搜索 + 复习状态筛选 + 分页 ----
    * 头部整块 sticky 吸顶：一页 20 条卡片很长，翻到一半想改关键词或换筛选
@@ -2341,15 +2533,19 @@ export class PracticePanel {
   .t-row button { flex: 0 0 auto; padding: 2px 6px; font-size: 11px; line-height: 1.5; }
   .t-lbl { min-width: 26px; color: var(--muted); font-size: 11px; }
   .t-mark { color: var(--accent); font-size: 10px; margin-left: 4px; }
-  .lib-card.selected { border-color: var(--accent); background: rgba(128,128,128,.08); }
-  .lib-card > div { flex: 1 1 auto; min-width: 0; }
-  .lib-del {
-    flex: 0 0 auto; padding: 4px 6px; font-size: 12px;
-    background: transparent; color: var(--muted);
-    border: 1px solid var(--border); border-radius: 3px;
+  /* 多选选中态：只画上右下三条边，左侧留给难度竖条 */
+  .lib-card.selected {
+    border-top-color: var(--accent); border-right-color: var(--accent);
+    border-bottom-color: var(--accent); background: rgba(128,128,128,.08);
   }
-  .lib-del:hover { color: var(--err); border-color: var(--err); }
-  .lib-mark { font-size: 16px; color: var(--accent); min-width: 22px; text-align: center; }
+  /* 「⋯」更多操作：删除等破坏性入口收进菜单，卡片左侧留给多选标记 */
+  .lib-more {
+    flex: 0 0 auto; padding: 0 6px; line-height: 20px;
+    background: transparent; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+  }
+  .lib-more:hover { color: var(--fg); border-color: var(--accent); }
+  .lib-mark { flex: 0 0 auto; font-size: 16px; color: var(--accent); min-width: 22px; text-align: center; }
 </style>
 </head>
 <body>
@@ -2397,6 +2593,8 @@ export class PracticePanel {
 <div id="reportView" class="report-view"></div>
 
 <div id="library" class="library">
+  <!-- 搜索 + 两组筛选（吸顶）；操作条在多选时才有多余按钮 -->
+  <div class="lib-head" id="libHead"></div>
   <div class="disc-bar" id="libBar"></div>
   <div class="disc-meta" id="libMeta">读取中…</div>
   <div id="libList"></div>
@@ -2408,6 +2606,10 @@ export class PracticePanel {
 <div id="reviewView" class="library"></div>
 
 <audio id="player" preload="auto"></audio>
+
+<!-- 素材「⋯」菜单：全局单例。挂在 body 下才能用 fixed 定位，
+     放进 #library 会被它的 overflow-y:auto 裁掉。 -->
+<div id="libMenu" class="lib-menu"></div>
 
 <script>
 const vscode = acquireVsCodeApi();
@@ -2739,6 +2941,42 @@ window.addEventListener('message', (e) => {
     if (discState.hits.length) renderDiscList();
   }
   if (msg.type === 'cachedList') { onCachedList(msg); }
+  /* 素材标记（已学完 / 难度）的写入结果。
+   * 宿主是唯一权威：本页从没做过乐观更新，失败时界面保持原状、只提示一句。 */
+  if (msg.type === 'materialFlags') {
+    if (msg.error) {
+      // 素材库视图里 #practice 是隐藏的，提示必须落在当前视图看得见的地方
+      if (currentView === 'library') {
+        libMeta.style.color = 'var(--err)';
+        libMeta.textContent = '状态保存失败：' + msg.error;
+      } else {
+        showNotice('状态保存失败：' + msg.error);
+      }
+    } else {
+      const dn = String(msg.dirName || '');
+      const learned = !!msg.learned;
+      const difficulty = msg.difficulty || null;
+      let changed = false;
+      lastCachedItems.forEach((it) => {
+        if (it.dirName !== dn) return;
+        it.learned = learned;
+        it.difficulty = difficulty;
+        changed = true;
+      });
+      // 被自己改到筛选条件之外：先留在原地并标黄，等下次换条件才真正移出
+      if (changed && libFiltering()) {
+        const it = lastCachedItems.find((x) => x.dirName === dn);
+        if (it && !libMatches(it)) libState.stale[dn] = true;
+        else delete libState.stale[dn];
+      }
+      if (state.material && state.material.dirName === dn) {
+        state.material.learned = learned;
+        state.material.difficulty = difficulty;
+        if (currentView === 'practice') render();
+      }
+      if (currentView === 'library') renderLib();
+    }
+  }
   if (msg.type === 'materialRemoved') {
     // 正在练习的素材被删除：停播并清空界面
     try { player.pause(); } catch (err) { /* 忽略 */ }
@@ -3970,14 +4208,209 @@ discSort.addEventListener('change', () => {
 //    -> 所有按钮（含「发现 TED」）全部点不动，且编辑器里毫无报错。
 //    历史事故：写成 {} as Record<string, boolean>，症状即「点击发现 TED 没反应」。
 //    注意本段不要使用反引号（会提前终止外层模板字符串），也不要写单反斜杠 n。
-let libState = { multi: false, selected: {} };
+/** 素材库每页条数 */
+const LIB_PAGE_SIZE = 10;
+
+/** 学习状态筛选项（顺序即展示顺序） */
+const LIB_STATUS_FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'todo', label: '未学完' },
+  { key: 'done', label: '已学完' },
+];
+
+/** 难度筛选项 */
+const LIB_DIFF_FILTERS = [
+  { key: 'all', label: '全部' },
+  { key: 'none', label: '未评级' },
+  { key: 'easy', label: '简单' },
+  { key: 'medium', label: '中等' },
+  { key: 'hard', label: '困难' },
+];
+
+/** 难度 → 中文文案（未评级由调用处决定怎么显示） */
+const LIB_DIFF_LABEL = { easy: '简单', medium: '中等', hard: '困难' };
+
+let libState = {
+  multi: false,
+  selected: {},
+  // 搜索、筛选与分页：页面侧状态，不落盘（重载后回到「全部」第 1 页）
+  query: '',
+  filter: 'all',
+  diff: 'all',
+  page: 0,
+  // 本次筛选下「被自己改动而不再满足条件」的素材（dirName → true）。
+  // 不立刻消失：刚点完就消失会让人以为被删了，想反悔也点不到 ——
+  // 等下次换搜索/筛选/翻页时才真正移出。
+  stale: {},
+};
 let lastCachedItems = [];
+
+const libMenuEl = document.getElementById('libMenu');
 
 // 用目录名找出素材标题，供宿主的确认框显示（拿不到就退回目录名）
 function libTitleOf(dirName) {
   const it = lastCachedItems.find((x) => x.dirName === dirName);
   return it && it.title ? it.title : dirName;
 }
+
+/** 加入日期：列表要能一眼比较新旧，用 YYYY-MM-DD，不用「3 天前」 */
+function fmtDate(ms) {
+  const t = Number(ms) || 0;
+  if (!t) return '未知';
+  const d = new Date(t);
+  if (isNaN(d.getTime())) return '未知';
+  const mm = ('0' + (d.getMonth() + 1)).slice(-2);
+  const dd = ('0' + d.getDate()).slice(-2);
+  return d.getFullYear() + '-' + mm + '-' + dd;
+}
+
+/** 关键词命中：只搜标题与作者，大小写不敏感 */
+function libHit(it, kw) {
+  if (!kw) return true;
+  const t = String(it.title || '').toLowerCase();
+  const p = String(it.presenter || '').toLowerCase();
+  return t.indexOf(kw) >= 0 || p.indexOf(kw) >= 0;
+}
+
+/** 一条素材是否满足当前搜索 + 两个筛选维度 */
+function libMatches(it) {
+  const kw = String(libState.query || '').trim().toLowerCase();
+  if (!libHit(it, kw)) return false;
+  if (libState.filter === 'todo' && it.learned) return false;
+  if (libState.filter === 'done' && !it.learned) return false;
+  if (libState.diff !== 'all' && (it.difficulty || 'none') !== libState.diff) return false;
+  return true;
+}
+
+/**
+ * 筛选条上的数量：按【搜索范围】统计，两个维度各自独立计数 ——
+ * 数字不会随另一组筛选跳动，用户看到的是「搜到的这些里各有多少」。
+ */
+function libCounts() {
+  const kw = String(libState.query || '').trim().toLowerCase();
+  const st = { all: 0, todo: 0, done: 0 };
+  const df = { all: 0, none: 0, easy: 0, medium: 0, hard: 0 };
+  for (const it of lastCachedItems) {
+    if (!libHit(it, kw)) continue;
+    st.all++;
+    if (it.learned) st.done++;
+    else st.todo++;
+    df.all++;
+    const d = it.difficulty || 'none';
+    if (df[d] === undefined) df.none++;
+    else df[d]++;
+  }
+  return { st: st, df: df };
+}
+
+/** 当前可见列表 = 符合筛选的 + 本次被自己改动而掉出筛选、暂时留在原位的 */
+function libVisible() {
+  const out = [];
+  for (const it of lastCachedItems) {
+    if (libMatches(it) || libState.stale[it.dirName]) out.push(it);
+  }
+  return out;
+}
+
+/** 是否有任何搜索/筛选条件（决定「全部删除」的文案与范围） */
+function libFiltering() {
+  return !!(String(libState.query || '').trim() || libState.filter !== 'all' || libState.diff !== 'all');
+}
+
+function clearLibFilters() {
+  libState.query = '';
+  libState.filter = 'all';
+  libState.diff = 'all';
+  libState.page = 0;
+  libState.stale = {};
+  renderLib();
+  libView.scrollTop = 0;
+}
+
+/* ---- 「⋯」菜单：全局单例、fixed 定位 ----
+ * 卡片在 overflow-y:auto 容器里，卡片内 absolute 的弹层会被容器裁掉
+ * （最后一张卡片尤其明显），滚轮一动还会与卡片错位。 */
+function closeLibMenu() {
+  if (!libMenuEl) return;
+  libMenuEl.classList.remove('open');
+  libMenuEl.innerHTML = '';
+}
+
+/**
+ * 打开素材菜单。info = { dirName, learned, difficulty }
+ * 先量尺寸再定位：菜单高度随内容变化，写死数值必然错位。
+ */
+function openLibMenu(btn, info) {
+  if (!libMenuEl || !btn || !info || !info.dirName) return;
+  const cur = info.difficulty || '';
+
+  let html = '<div class="mh">难度</div>';
+  html += '<div class="mi" data-diff=""><span class="tick">' + (cur ? '' : '✓') + '</span>未评级</div>';
+  for (const d of ['easy', 'medium', 'hard']) {
+    html += '<div class="mi" data-diff="' + d + '"><span class="tick">' +
+      (cur === d ? '✓' : '') + '</span>' + LIB_DIFF_LABEL[d] + '</div>';
+  }
+  html += '<div class="msep"></div>';
+  html += '<div class="mi" data-learned="' + (info.learned ? '0' : '1') + '"><span class="tick"></span>' +
+    (info.learned ? '取消已学完' : '标记已学完') + '</div>';
+  html += '<div class="msep"></div>';
+  html += '<div class="mi del" data-del="1"><span class="tick"></span>删除素材</div>';
+  libMenuEl.innerHTML = html;
+  libMenuEl.classList.add('open');
+
+  // 先挪到屏幕外量尺寸，再定位
+  libMenuEl.style.left = '-9999px';
+  libMenuEl.style.top = '0px';
+  const r = btn.getBoundingClientRect();
+  const w = libMenuEl.offsetWidth;
+  const h = libMenuEl.offsetHeight;
+  let left = r.right - w;
+  if (left < 4) left = 4;
+  let top = r.bottom + 4;
+  if (top + h > window.innerHeight - 4) top = Math.max(4, r.top - h - 4);
+  libMenuEl.style.left = Math.round(left) + 'px';
+  libMenuEl.style.top = Math.round(top) + 'px';
+
+  libMenuEl.querySelectorAll('.mi').forEach((el) => {
+    el.onclick = (ev) => {
+      ev.stopPropagation();
+      if (el.dataset.del) {
+        closeLibMenu();
+        // 确认由宿主弹出（原因见 libDoDelete）
+        vscode.postMessage({
+          type: 'deleteCached',
+          dirNames: [info.dirName],
+          titles: [libTitleOf(info.dirName)],
+        });
+        return;
+      }
+      // 宿主是唯一权威：这里只发意图，界面等回包再改（不做乐观更新）
+      const patch = { type: 'setMaterialFlags', dirName: info.dirName };
+      if (el.dataset.learned) patch.learned = el.dataset.learned === '1';
+      else patch.difficulty = el.dataset.diff || null;
+      closeLibMenu();
+      vscode.postMessage(patch);
+    };
+  });
+}
+
+// 点菜单外 / 任何容器滚动 / 窗口尺寸变化 → 关闭菜单。
+// ⚠️ 触发按钮自己要负责开关，这里必须放行，否则「再点一次」会先关后开。
+document.addEventListener('click', (e) => {
+  if (!libMenuEl || !libMenuEl.classList.contains('open')) return;
+  if (libMenuEl.contains(e.target)) return;
+  if (e.target.closest && e.target.closest('.lib-more')) return;
+  if (e.target.id === 'matDiff') return;
+  closeLibMenu();
+});
+document.addEventListener('scroll', () => closeLibMenu(), true);
+window.addEventListener('resize', () => closeLibMenu());
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && libMenuEl && libMenuEl.classList.contains('open')) {
+    e.preventDefault();
+    closeLibMenu();
+  }
+});
 
 function renderLibBar() {
   const bar = document.getElementById('libBar');
@@ -4003,25 +4436,131 @@ function renderLibBar() {
       libState.selected = {};
       renderLib();
     };
-  } else {
-    bar.innerHTML =
-      '<button id="libMulti" class="ghost">多选删除</button>' +
-      '<button id="libDeleteAll" class="ghost">全部删除</button>';
-    document.getElementById('libMulti').onclick = () => {
-      libState.multi = true;
-      libState.selected = {};
+    return;
+  }
+
+  // 「全部删除」跟着筛选走：按钮上写多少条就删多少条 ——
+  // 否则「我只想看简单的」之后的误点会一键清空整个素材库
+  const vis = libVisible();
+  bar.innerHTML =
+    '<button id="libMulti" class="ghost">多选删除</button>' +
+    '<button id="libDeleteAll" class="ghost"' + (vis.length ? '' : ' disabled') + '>' +
+      (libFiltering() ? '删除筛选结果 (' + vis.length + ')' : '全部删除') +
+    '</button>';
+  document.getElementById('libMulti').onclick = () => {
+    libState.multi = true;
+    libState.selected = {};
+    renderLib();
+  };
+  document.getElementById('libDeleteAll').onclick = () => {
+    if (!vis.length) return;
+    // 确认由宿主弹出（原因见 libDoDelete）
+    vscode.postMessage({
+      type: 'deleteCached',
+      dirNames: vis.map((it) => it.dirName),
+      titles: vis.map((it) => it.title),
+    });
+  };
+}
+
+/**
+ * 素材库头部：搜索框 + 两组筛选条（吸顶）。
+ *
+ * ⚠️ 单独抽出来是因为「筛选结果为空」时会提前 return，那时仍然要能改关键词、
+ *    点筛选条切回「全部」，否则用户就卡死在空页上了。
+ */
+function renderLibHead() {
+  const head = document.getElementById('libHead');
+  if (!head) return;
+  const counts = libCounts();
+  let html = '<div class="lib-search">' +
+    '<input id="libQuery" type="text" placeholder="搜索标题或作者…" value="' +
+      esc(libState.query) + '" />' +
+    (libState.query
+      ? '<button id="libQueryClear" class="ghost" title="清空搜索">✕</button>'
+      : '') +
+    '</div>' +
+    '<div class="lib-filters"><span class="grp">学习状态</span>';
+  for (const it of LIB_STATUS_FILTERS) {
+    html += '<button class="ghost lib-filter' + (libState.filter === it.key ? ' on' : '') +
+      '" data-f="' + it.key + '">' + it.label + ' ' + counts.st[it.key] + '</button>';
+  }
+  html += '</div><div class="lib-filters"><span class="grp">难度</span>';
+  for (const it of LIB_DIFF_FILTERS) {
+    html += '<button class="ghost lib-diff' + (libState.diff === it.key ? ' on' : '') +
+      '" data-d="' + it.key + '">' + it.label + ' ' + counts.df[it.key] + '</button>';
+  }
+  html += '</div>';
+  head.innerHTML = html;
+  bindLibHead();
+}
+
+/** 更新搜索关键词：回第 1 页并整段重渲染（光标位置由 renderLib 还回去） */
+function applyLibQuery(v) {
+  const next = String(v || '');
+  if (next === libState.query) return;
+  libState.query = next;
+  libState.page = 0;
+  libState.stale = {};
+  renderLib();
+}
+
+function bindLibHead() {
+  const head = document.getElementById('libHead');
+  if (!head) return;
+  const q = document.getElementById('libQuery');
+  if (q) {
+    // ⚠️ 中文/拼音输入法合成期间绝不能重渲染，否则会把正在合成的串打断
+    let composing = false;
+    q.addEventListener('compositionstart', () => { composing = true; });
+    q.addEventListener('compositionend', () => {
+      composing = false;
+      applyLibQuery(q.value);
+      libView.scrollTop = 0;
+    });
+    q.addEventListener('input', (e) => {
+      if (composing) return;
+      applyLibQuery(e.target.value);
+      libView.scrollTop = 0;
+    });
+    q.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        q.value = '';
+        applyLibQuery('');
+      }
+    });
+  }
+  const qc = document.getElementById('libQueryClear');
+  if (qc) {
+    qc.onclick = () => {
+      libState.query = '';
+      libState.page = 0;
+      libState.stale = {};
       renderLib();
-    };
-    document.getElementById('libDeleteAll').onclick = () => {
-      if (!lastCachedItems.length) return;
-      // 确认由宿主弹出（原因见 libDoDelete）
-      vscode.postMessage({
-        type: 'deleteCached',
-        dirNames: lastCachedItems.map((it) => it.dirName),
-        titles: lastCachedItems.map((it) => it.title),
-      });
+      libView.scrollTop = 0;
     };
   }
+  head.querySelectorAll('.lib-filter').forEach((btn) => {
+    btn.onclick = () => {
+      if (libState.filter === btn.dataset.f) return;
+      libState.filter = btn.dataset.f;
+      libState.page = 0;
+      libState.stale = {};
+      renderLib();
+      libView.scrollTop = 0;
+    };
+  });
+  head.querySelectorAll('.lib-diff').forEach((btn) => {
+    btn.onclick = () => {
+      if (libState.diff === btn.dataset.d) return;
+      libState.diff = btn.dataset.d;
+      libState.page = 0;
+      libState.stale = {};
+      renderLib();
+      libView.scrollTop = 0;
+    };
+  });
 }
 
 function onCachedList(msg) {
@@ -4029,61 +4568,165 @@ function onCachedList(msg) {
   lastCachedItems = msg.items || [];
   // 素材库是最新的磁盘事实 —— 顺带同步「发现 TED」的已下载标注
   syncDiscCached(lastCachedItems);
-  renderLibBar();
+  // 重推后 stale 只保留「素材还在、但仍然不匹配当前筛选」的那些
+  const keep = {};
+  for (const dn of Object.keys(libState.stale)) {
+    const it = lastCachedItems.find((x) => x.dirName === dn);
+    if (it && !libMatches(it)) keep[dn] = true;
+  }
+  libState.stale = keep;
+  renderLib();
+}
 
-  if (!lastCachedItems.length) {
-    libMeta.textContent = '还没有已缓存的素材。去「发现 TED」挑一篇开始。';
-    libList.innerHTML = '';
+/**
+ * 渲染素材库（搜索 + 两组筛选 + 分页 + 卡片）。
+ * 任何状态变化（选素材、改标记、删除、翻页）都只走这一个入口。
+ */
+function renderLib() {
+  // 搜索框会随 innerHTML 重建，先记住焦点与光标，重建后还回去 ——
+  // 不这么做的话每敲一个字就丢焦点，搜索框等于只能输入一个字符
+  const qEl = document.getElementById('libQuery');
+  const qFocus = !!qEl && document.activeElement === qEl;
+  const qSel = qEl ? qEl.selectionStart : 0;
+  const restoreFocus = () => {
+    if (!qFocus) return;
+    const nq = document.getElementById('libQuery');
+    if (!nq) return;
+    nq.focus();
+    try { nq.setSelectionRange(qSel, qSel); } catch (e) { /* 某些输入类型不支持选区 */ }
+  };
+
+  renderLibHead();
+  renderLibBar();
+  // 上一次可能是「保存失败」的红字，重渲染时恢复常规色
+  libMeta.style.color = '';
+
+  const total = lastCachedItems.length;
+  if (!total) {
+    libMeta.textContent = '暂无素材';
+    libList.innerHTML = '<div class="center">还没有下载任何素材。<br>' +
+      '去「发现 TED」挑一篇开始精听。</div>';
+    libFoot.innerHTML = '';
+    restoreFocus();
     return;
   }
+
+  const vis = libVisible();
+  const pages = Math.max(1, Math.ceil(vis.length / LIB_PAGE_SIZE));
+  // 删条目 / 切筛选后页码可能越界，夹回来 —— 否则会渲染出空白的「第 3/2 页」
+  if (libState.page > pages - 1) libState.page = pages - 1;
+  if (libState.page < 0) libState.page = 0;
+  const start = libState.page * LIB_PAGE_SIZE;
+  const pageItems = vis.slice(start, start + LIB_PAGE_SIZE);
+
   libMeta.textContent = libState.multi
     ? '多选模式：点卡片勾选，然后点「删除所选」'
-    : '已缓存 ' + lastCachedItems.length + ' 篇 · 点卡片继续练习';
+    : '共 ' + total + ' 篇' +
+      (vis.length === total ? '' : ' · 筛选出 ' + vis.length + ' 篇') +
+      ' · 点卡片继续练习';
 
-  libList.innerHTML = lastCachedItems.map((it) => {
+  if (!vis.length) {
+    // 与「一篇素材都没有」分开：这两种空态用户要做的事完全不同
+    libList.innerHTML = '<div class="center">没有符合条件的素材。<br>' +
+      '换个关键词，或者清空搜索与筛选。</div>';
+    libFoot.innerHTML = '<div class="fav-pager">' +
+      '<button id="libClearFilters" class="ghost">清空搜索与筛选</button></div>';
+    const clr = document.getElementById('libClearFilters');
+    if (clr) clr.onclick = () => clearLibFilters();
+    restoreFocus();
+    return;
+  }
+
+  libList.innerHTML = pageItems.map((it) => {
+    const diff = it.difficulty || '';
+    const dlabel = diff ? LIB_DIFF_LABEL[diff] : '未评级';
     const badge = it.hasAudio
       ? '<span class="badge ok">音频就绪</span>'
       : '<span class="badge no">缺音频</span>';
-    let lead = '';
-    if (libState.multi) {
-      lead = '<span class="lib-mark">' + (libState.selected[it.dirName] ? '☑' : '☐') + '</span>';
-    } else {
-      lead = '<button class="lib-del" data-dirname="' + esc(it.dirName) + '" title="删除该素材">🗑</button>';
-    }
+    const stale = !!libState.stale[it.dirName];
+    const lead = libState.multi
+      ? '<span class="lib-mark">' + (libState.selected[it.dirName] ? '☑' : '☐') + '</span>'
+      : '';
+    const more = libState.multi
+      ? ''
+      : '<button class="lib-more" data-dirname="' + esc(it.dirName) + '" title="更多操作">⋯</button>';
+    // 信息行固定顺序：名字 → 句数 → 时长 → 加入时间（一行，超宽省略）
+    const metaBits = [];
+    if (it.presenter) metaBits.push(esc(it.presenter));
+    metaBits.push(it.sentenceCount + ' 句');
+    metaBits.push(fmtTime(it.durationMs));
+    metaBits.push('加入 ' + fmtDate(it.addedAt));
     return '<div class="lib-card' + (libState.selected[it.dirName] ? ' selected' : '') +
-      '" data-dirname="' + esc(it.dirName) + '">' + lead +
-      '<div><div class="t">' + esc(it.title) + badge + '</div>' +
-      '<div class="meta">' + it.sentenceCount + ' 句 · ' + fmtTime(it.durationMs) + '</div></div>' +
-      '</div>';
+        (it.learned ? ' learned' : '') + (stale ? ' stale' : '') +
+        '" data-dirname="' + esc(it.dirName) + '" data-diff="' + esc(diff) + '">' +
+      lead +
+      '<div class="lib-body">' +
+        '<div class="t">' + (it.learned ? '✓ ' : '') + esc(it.title) + '</div>' +
+        '<div class="meta lib-line">' + metaBits.join(' · ') + '</div>' +
+        // 徽标单独一行：混在信息行里一窄就会折行，把日期挤得七零八落
+        '<div class="lib-tags">' + badge +
+          '<span class="badge d-' + (diff || 'none') + '">' + dlabel + '</span>' +
+          (it.learned ? '<span class="badge ok">已学完</span>' : '') +
+          (stale ? '<span class="lib-stale">· 已不符合当前筛选</span>' : '') +
+        '</div>' +
+      '</div>' + more +
+    '</div>';
   }).join('');
+
+  libFoot.innerHTML = '<div class="fav-pager">' +
+    '<button id="libPrev" class="ghost"' + (libState.page === 0 ? ' disabled' : '') +
+      '>上一页</button>' +
+    '<span>第 ' + (libState.page + 1) + ' / ' + pages + ' 页 · 共 ' + vis.length + ' 条</span>' +
+    '<button id="libNext" class="ghost"' + (libState.page >= pages - 1 ? ' disabled' : '') +
+      '>下一页</button>' +
+    '</div>';
 
   libList.querySelectorAll('.lib-card').forEach((el) => {
     el.onclick = (ev) => {
-      if (ev.target.closest('.lib-del')) return; // 删除按钮有自己的处理
+      // 「⋯」按钮有自己的处理，别在这里当成"打开素材"
+      if (ev.target.closest && ev.target.closest('.lib-more')) return;
       const dn = el.dataset.dirname;
       if (libState.multi) {
         if (libState.selected[dn]) delete libState.selected[dn];
         else libState.selected[dn] = true;
         renderLib();
       } else {
+        closeLibMenu();
         showView('practice');
         vscode.postMessage({ type: 'openCached', dirName: dn });
       }
     };
   });
-  libList.querySelectorAll('.lib-del').forEach((el) => {
+  libList.querySelectorAll('.lib-more').forEach((el) => {
     el.onclick = (ev) => {
       ev.stopPropagation();
       const dn = el.dataset.dirname;
-      // 确认由宿主弹出（原因见 libDoDelete）
-      vscode.postMessage({ type: 'deleteCached', dirNames: [dn], titles: [libTitleOf(dn)] });
+      const it = lastCachedItems.find((x) => x.dirName === dn);
+      if (it) openLibMenu(el, it);
     };
   });
-}
 
-/** 选中态/模式切换后用最近一次列表数据重渲染 */
-function renderLib() {
-  onCachedList({ items: lastCachedItems, error: null });
+  const prev = document.getElementById('libPrev');
+  if (prev) {
+    prev.onclick = () => {
+      if (libState.page <= 0) return;
+      libState.page -= 1;
+      libState.stale = {};
+      renderLib();
+      libView.scrollTop = 0;
+    };
+  }
+  const next = document.getElementById('libNext');
+  if (next) {
+    next.onclick = () => {
+      libState.page += 1;
+      libState.stale = {};
+      renderLib();
+      libView.scrollTop = 0;
+    };
+  }
+
+  restoreFocus();
 }
 
 function showProgress(text, percent) {
@@ -4198,6 +4841,23 @@ function bindListResize(handle) {
   });
 }
 
+/**
+ * 精听页标题下方的标记行（难度 / 已学完）。
+ *
+ * 没有素材目录（不在素材库里）就整行不渲染 —— 没有落盘位置时出现控件，
+ * 用户点了只会得到一句"保存失败"，不如不显示。
+ */
+function practiceFlagHtml(m) {
+  if (!m || !m.dirName) return '';
+  const d = m.difficulty || '';
+  return '<div class="sub lib-flags">' +
+    '<button class="ghost' + (d ? ' d-' + d : '') + '" id="matDiff" title="设置难度">难度：' +
+      (d ? LIB_DIFF_LABEL[d] : '未评级') + '</button>' +
+    '<button class="ghost' + (m.learned ? ' on' : '') + '" id="matLearned">' +
+      (m.learned ? '✓ 已学完' : '标记已学完') + '</button>' +
+    '</div>';
+}
+
 function render() {
   const m = state.material;
   if (!m) return;
@@ -4222,6 +4882,7 @@ function render() {
       '<h2>' + esc(m.title) + '</h2>' +
       '<div class="sub">' + esc(m.presenter || '') + ' · ' + m.sentences.length + ' 句 · ' +
         fmtTime(m.durationMs) + '</div>' +
+      practiceFlagHtml(m) +
     '</div>' +
     '<div class="main' + (state.listCollapsed ? ' collapsed' : '') +
       (state.stacked ? ' stacked' : '') + '">' +
@@ -4231,6 +4892,29 @@ function render() {
       '<div class="list" id="list"></div>' +
       '<div class="practice" id="practice"></div>' +
     '</div>';
+
+  // 标题下的标记行：难度点开菜单（与素材库共用 #libMenu），已学完一键切换。
+  // ⚠️ 走宿主写盘、等 materialFlags 回包再重渲染，不做乐观更新。
+  const matDiff = document.getElementById('matDiff');
+  if (matDiff) {
+    matDiff.onclick = (ev) => {
+      ev.stopPropagation();
+      openLibMenu(ev.currentTarget, {
+        dirName: m.dirName,
+        learned: !!m.learned,
+        difficulty: m.difficulty || '',
+      });
+    };
+  }
+  const matLearned = document.getElementById('matLearned');
+  if (matLearned) {
+    matLearned.onclick = () =>
+      vscode.postMessage({
+        type: 'setMaterialFlags',
+        dirName: m.dirName,
+        learned: !m.learned,
+      });
+  }
 
   // ★ 顺序有讲究（2026-09-20 二次修复）：必须先填操作区、再定列表占比、
   //   最后填列表并定位当前句。stacked 布局下 .practice 是 flex:0 1 auto

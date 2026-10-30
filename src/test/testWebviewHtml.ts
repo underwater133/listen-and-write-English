@@ -1291,6 +1291,150 @@ check(
   '发现 player.on* 属性赋值，复用元素时不可靠（应改用 addEventListener）'
 );
 
+/* ---------- 素材库：标记 / 搜索 / 筛选 / 分页（0.1.5） ----------
+ *
+ * 这一批的核心约束，挂了任何一条都不是小问题：
+ *   - 每页 10 条；切搜索/筛选回第 1 页；页码越界夹回
+ *   - 搜索只搜「标题 + 作者」；两组筛选（学习状态 / 难度）叠加生效
+ *   - 「全部删除」跟着筛选走 —— 筛选态下一键清库是灾难
+ *   - 已学完 / 难度落在素材目录的 learn.json，绝不写进 material.json
+ *   - 刚改完标记的卡片不立刻从筛选结果里消失（否则想反悔都点不到）
+ */
+const flagsSrc = fs.readFileSync(
+  path.join(__dirname, '../../src/core/materialFlags.ts'),
+  'utf8'
+);
+
+check(
+  'panel.ts: 素材库每页 10 条',
+  /const LIB_PAGE_SIZE = 10;/.test(panelCode),
+  '分页条数与需求不一致'
+);
+check(
+  'panel.ts: 素材库有两组筛选项（学习状态 / 难度）',
+  /const LIB_STATUS_FILTERS = \[/.test(panelCode) &&
+    /const LIB_DIFF_FILTERS = \[/.test(panelCode) &&
+    /key: 'done'/.test(panelCode) &&
+    /key: 'none'/.test(panelCode),
+  '缺少筛选维度定义'
+);
+check(
+  'panel.ts: 素材库头部与「⋯」菜单的 DOM 存在',
+  /id="libHead"/.test(panel) && /id="libQuery"/.test(panel) && /id="libMenu"/.test(panel),
+  '缺少搜索框或菜单容器'
+);
+check(
+  'panel.ts: 「⋯」菜单全局单例 + fixed 定位',
+  /\.lib-menu \{[\s\S]{0,220}position: fixed/.test(panel) &&
+    /getElementById\('libMenu'\)/.test(panelCode),
+  '菜单放在卡片内用 absolute 会被 .library 的 overflow 裁掉'
+);
+check(
+  'panel.ts: 菜单支持点外 / Esc / 滚动关闭',
+  /addEventListener\('scroll', \(\) => closeLibMenu\(\), true\)/.test(panelCode) &&
+    /e\.key === 'Escape' && libMenuEl/.test(panelCode) &&
+    /e\.target\.closest\('\.lib-more'\)/.test(panelCode),
+  'fixed 弹层不跟随滚动，不关会与卡片错位'
+);
+check(
+  'panel.ts: 标记变更走 setMaterialFlags（宿主写盘后回推，不做乐观更新）',
+  /type: 'setMaterialFlags'/.test(panelCode) &&
+    /case 'setMaterialFlags'/.test(panelCode) &&
+    /type: 'materialFlags'/.test(panelCode),
+  '缺少标记的读写通道'
+);
+check(
+  'materialFlags.ts: 标记落在素材目录的 learn.json（不碰 material.json）',
+  /const FLAGS_FILE = 'learn\.json'/.test(flagsSrc) &&
+    /path\.join\(dir, FLAGS_FILE\)/.test(flagsSrc) &&
+    !/'material\.json'/.test(flagsSrc),
+  '写进 material.json 会被「重新抓元数据时整体重写」冲掉'
+);
+check(
+  'materialFlags.ts: 难度取值有白名单（非法值当未评级）',
+  /DIFFICULTIES/.test(flagsSrc) &&
+    /isMaterialDifficulty/.test(flagsSrc) &&
+    /'easy'/.test(flagsSrc) &&
+    /'medium'/.test(flagsSrc) &&
+    /'hard'/.test(flagsSrc),
+  '难度没有白名单校验，界面传什么就存什么'
+);
+check(
+  'materialFlags.ts: 坏文件 / 缺字段静默回退默认值',
+  /catch \{\s*return defaultMaterialFlags\(\);/.test(flagsSrc),
+  '读标记抛错会让整篇素材打不开'
+);
+check(
+  'panel.ts: 素材列表带上 presenter / 加入时间 / 学习标记',
+  /presenter: m\.presenter \|\| ''/.test(panelCode) &&
+    /learned: flags\.learned/.test(panelCode) &&
+    /difficulty: flags\.difficulty/.test(panelCode),
+  '素材库拿不到作者/日期/标记，搜索与筛选会失效'
+);
+check(
+  'panel.ts: 加入日期缺失时退回 material.json 的 mtime',
+  /addedAt = fs\.statSync\(metaPath\)\.mtimeMs/.test(panelCode),
+  '旧素材会显示成「未知」'
+);
+check(
+  'panel.ts: 素材搜索只搜标题与作者',
+  /function libHit[\s\S]{0,300}it\.title[\s\S]{0,120}it\.presenter/.test(panelCode) &&
+    !/function libHit[\s\S]{0,400}description/.test(panelCode),
+  '搜索范围跑偏（需求：标题或作者）'
+);
+check(
+  'panel.ts: 「全部删除」跟随筛选（按钮写多少条就删多少条）',
+  /libFiltering\(\) \? '删除筛选结果 \(' \+ vis\.length \+ '\)' : '全部删除'/.test(panelCode),
+  '筛选态下一键删全部 = 误删灾难'
+);
+check(
+  'panel.ts: 改完标记不立刻从筛选结果消失（stale 保留 + 标黄）',
+  /libState\.stale\[it\.dirName\]/.test(panelCode) &&
+    /stale: \{\}/.test(panelCode) &&
+    /lib-stale/.test(panelCode),
+  '刚点完的卡片瞬间消失，想反悔也点不到'
+);
+check(
+  'panel.ts: 素材库页码越界夹回，切搜索/筛选回第 1 页',
+  /if \(libState\.page > pages - 1\) libState\.page = pages - 1;/.test(panelCode) &&
+    /libState\.query = next;\s*libState\.page = 0;/.test(panelCode),
+  '切筛选后停在旧页码会渲染出空白页'
+);
+check(
+  'panel.ts: 素材库两种空态分开（没素材 / 筛选无结果）',
+  /还没有下载任何素材/.test(panel) &&
+    /没有符合条件的素材/.test(panel) &&
+    /libClearFilters/.test(panel),
+  '两种空态混在一起会让人以为素材丢了'
+);
+check(
+  'panel.ts: 精听页标题下有标记行，无素材目录时整行隐藏',
+  /function practiceFlagHtml/.test(panelCode) &&
+    /if \(!m \|\| !m\.dirName\) return '';/.test(panelCode) &&
+    /practiceFlagHtml\(m\)/.test(panelCode),
+  '没有落盘位置还显示控件，点了只会报保存失败'
+);
+check(
+  'panel.ts: 素材库的搜索/筛选/页码不进 setState（与收藏视图一致）',
+  /vscode\.setState\(\{[\s\S]{0,240}stackedRatio: state\.stackedRatio,/.test(panelCode) &&
+    !/libQuery\s*:/.test(panelCode),
+  '落盘筛选状态会让人重开面板后误以为素材丢了'
+);
+// 卡片版式（用户明确要求）：信息行 = 名字 · 句数 · 时长 · 加入时间，且必须一行；
+// 三个徽标另起一行。混在一起时窄面板会把日期挤到第二行，看起来像两块信息。
+check(
+  'panel.ts: 卡片信息行顺序 = 名字 → 句数 → 时长 → 加入时间（锁死单行）',
+  /if \(it\.presenter\) metaBits\.push[\s\S]{0,200}'加入 ' \+ fmtDate\(it\.addedAt\)/.test(panelCode) &&
+    /metaBits\.join\(' · '\)/.test(panelCode) &&
+    /\.lib-card \.meta \{[\s\S]{0,180}white-space: nowrap/.test(panelCode),
+  '信息行顺序不对，或没有锁死单行（窄了就折行）'
+);
+check(
+  'panel.ts: 三个徽标单独一行（不与信息行混排）',
+  /class="lib-tags"/.test(panelCode) && /\.lib-tags \{[\s\S]{0,140}flex-wrap: wrap/.test(panelCode),
+  '徽标混进信息行会把日期挤到第二行'
+);
+
 /* ---------- 结果 ---------- */
 
 console.log(`\n=== 结果: ${pass} 通过 / ${fail} 失败 ===`);
