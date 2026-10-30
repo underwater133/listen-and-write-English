@@ -9,3 +9,6 @@ aac-route-test.html
 out/test/**
 build/**
 scripts/**
+# 编辑器 / 代理工具的本地元数据（plan、history 之类），与扩展运行无关
+.codebuddy/**
+.workbuddy/**
