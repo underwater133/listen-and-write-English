@@ -3287,8 +3287,10 @@ function rvActions(withReveal, canPlay) {
     '<button class="rv-grade ghost rv-mid" data-g="fuzzy">模糊</button>' +
     '<button class="rv-grade" data-g="know">认识</button>' +
     '</div>';
+  // 说明只列「此刻真的能用」的键：w 只在还没翻面时可用（翻面后按钮就收起了）
   h += '<div class="rv-keys">' +
     (canPlay ? '<b>空格</b> 播放例句　' : '') +
+    (withReveal ? '<b>w</b> 看答案　' : '') +
     '<b>a</b> 不认识　<b>s</b> 模糊　<b>d</b> 认识' +
     '</div>';
   return h;
@@ -3315,6 +3317,13 @@ function rvGrade(grade) {
     // 告诉宿主「点评分时看没看答案」：没看又点了不认识/模糊时，宿主会停在原地
     revealed: !!state.rvReveal,
   });
+}
+
+/** 「看答案」：翻面。已翻面时无动作（按钮此时也已收起） */
+function rvReveal() {
+  if (!state.rvCard || state.rvReveal) return;
+  state.rvReveal = true;
+  renderReviewView();
 }
 
 /** 停留态的「下一个 / 完成」 */
@@ -3450,7 +3459,7 @@ function renderReviewView() {
     const go = document.getElementById('rvGo');
     if (go) go.onclick = () => rvGoNext();
     const rev = document.getElementById('rvReveal');
-    if (rev) rev.onclick = () => { state.rvReveal = true; renderReviewView(); };
+    if (rev) rev.onclick = () => rvReveal();
     reviewView.querySelectorAll('.rv-grade').forEach((el) => {
       el.onclick = () => rvGrade(el.dataset.g);
     });
@@ -3708,11 +3717,12 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ---------------- 复习界面快捷键 ----------------
- * 空格 = 播放例句音频 / a = 不认识 / s = 模糊 / d = 认识（停留态里是「下一个」）
+ * 空格 = 播放例句音频 / w = 看答案 / a = 不认识 / s = 模糊 / d = 认识（停留态里是「下一个」）
  *
  * ⚠️ d 一键两义是刻意的：自评时它是「认识」，停留态（已评分、等你看答案）里
  *    自评按钮已经收起、屏幕上只剩「下一个 / 完成」那一个按钮，不存在歧义 ——
  *    于是「a 不认识 → 看一眼答案 → d 继续」可以一路盲打，手不用离开键盘。
+ * ⚠️ w 与精听界面的「切播放模式」同键不同义：两个视图互斥，不会打架。
  * ⚠️ 与精听界面同一套守卫：只在复习视图、不带修饰键、输入框聚焦时不抢键。
  *    e.repeat 也拦掉：按住不放在宿主侧会被当成连点评分。
  * ⚠️ 首页 / 轮次过场页 / 结束页没有卡，直接不管（否则空格会把过场页
@@ -3729,6 +3739,7 @@ document.addEventListener('keydown', (e) => {
   if (!state.rvCard) return;
   switch (e.key) {
     case ' ': e.preventDefault(); rvPlayExample(); break;
+    case 'w': rvReveal(); break;
     case 'a': rvGrade('unknown'); break;
     case 's': rvGrade('fuzzy'); break;
     case 'd': if (state.rvHeld) rvGoNext(); else rvGrade('know'); break;

@@ -685,14 +685,17 @@ check(
   '页面没告诉宿主看没看答案，宿主无法判断要不要停留'
 );
 check(
-  'panel.ts(复习快捷键): 空格播放例句 / a 不认识 / s 模糊 / d 认识（停留态为下一个）',
+  'panel.ts(复习快捷键): 空格播放例句 / w 看答案 / a 不认识 / s 模糊 / d 认识（停留态为下一个）',
   /function rvGrade\(grade\)/.test(panel) &&
+    /function rvReveal\(\)/.test(panel) &&
     /function rvGoNext\(\)/.test(panel) &&
     /function rvPlayExample\(\)/.test(panel) &&
     // 按钮与快捷键必须调同一套函数，否则行为会漂移
     /el\.onclick = \(\) => rvGrade\(el\.dataset\.g\)/.test(panel) &&
+    /if \(rev\) rev\.onclick = \(\) => rvReveal\(\)/.test(panel) &&
     /if \(go\) go\.onclick = \(\) => rvGoNext\(\)/.test(panel) &&
     /case ' ': e\.preventDefault\(\); rvPlayExample\(\); break;/.test(panel) &&
+    /case 'w': rvReveal\(\); break;/.test(panel) &&
     /case 'a': rvGrade\('unknown'\); break;/.test(panel) &&
     /case 's': rvGrade\('fuzzy'\); break;/.test(panel) &&
     /case 'd': if \(state\.rvHeld\) rvGoNext\(\); else rvGrade\('know'\); break;/.test(panel),
