@@ -2771,6 +2771,8 @@ const PLAY_MODE_LABEL = { off: '循环关', loop: '循环开', auto: '连播' };
 
 /** render() 最近一次渲染的句号 —— 用于判断「同句重渲染」（恢复滚动位置） */
 let renderedIndex = -1;
+/** render() 最近一次渲染的素材对象 —— 选区只在同一篇素材的同一句内有效 */
+let renderedMaterial = null;
 
 let state = {
   material: null,
@@ -5116,6 +5118,15 @@ function render() {
   const prevPracticeScroll = oldPractice ? oldPractice.scrollTop : 0;
   const sameIndex = renderedIndex === state.currentIndex;
 
+  // 选区只对「同一篇素材的同一句」有效：切句、切素材都自动取消。
+  // ⚠️ 历史 bug：选区归属原来只记了句号（favSelFor），不记素材 ——
+  //    换到别的素材、恰好也停在同一句号时，旧选区会原样落到新素材的那一句上
+  //    （看起来像「选区跟着换了篇」）。这里按【素材对象】+ 句号双重判定。
+  if (!sameIndex || renderedMaterial !== m) {
+    state.favSel = [];
+    state.favSelFor = -1;
+  }
+
   // 左右布局用 « »，上下布局用 ▴ ▾（朝向跟着布局走，不然会看不懂）
   const toggleArrow = state.stacked
     ? (state.listCollapsed ? '▾' : '▴')
@@ -5179,6 +5190,7 @@ function render() {
   const newPractice = document.getElementById('practice');
   if (newPractice && sameIndex) newPractice.scrollTop = prevPracticeScroll;
   renderedIndex = state.currentIndex;
+  renderedMaterial = m;
 
   // 整页重建会把答案卡里的 token 全部销毁：悬停态必须一起清掉，
   // 否则卡片会继续指着一个已经不在文档里的元素（点词选中 → 重建 → 卡片悬空）。

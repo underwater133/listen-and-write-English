@@ -934,6 +934,19 @@ check(
     /async function playCurrent\(\) \{[\s\S]{0,220}lookPause = null;/.test(panel),
   '手动暂停后移开鼠标，音频会自己又播起来'
 );
+
+/* ---------- 选区归属（2026-11-02 修复） ----------
+ * 真实 bug：切到别的素材、恰好停在同一句号时，上一篇的选区原样落在新素材的
+ * 那一句上（选区「跟着换了篇」）；切句再回来也不算过期。
+ * 判据必须是「素材对象 + 句号」，只记句号是不够的。
+ */
+check(
+  'panel.ts(页面): 选区只在「同一篇素材的同一句」内有效（切句 / 切素材自动取消）',
+  /let renderedMaterial = null;/.test(panel) &&
+    /if \(!sameIndex \|\| renderedMaterial !== m\) \{[\s\S]{0,140}state\.favSel = \[\];/.test(panel) &&
+    /renderedMaterial = m;/.test(panel),
+  '只记句号不记素材：换素材且句号相同时，旧选区会落到新素材上'
+);
 check(
   'panel.ts: 精听快捷键 a/d/空格/w/s（与按钮共用动作函数，输入框聚焦时不抢键）',
   /function (gotoPrev|gotoNext|togglePlayPause|cyclePlayMode|cycleRate)/.test(panel) &&
