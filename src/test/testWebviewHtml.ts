@@ -898,6 +898,42 @@ check(
   /entry\.base = base/.test(dictSrc) && /base\?: string/.test(dictSrc),
   '没有原形信息，悬停 went 只能看到 go 的释义，看不出是哪个词'
 );
+
+/* ---------- 查词让路：悬浮 / 选中时自动暂停播放（2026-11-02） ----------
+ * 语义：悬浮 → 卡片出现时暂停，移开延迟续播；点词选中 → 暂停且永不自动续播。
+ *
+ * 三条都是「不这么写就明显不对」的：
+ *   - 暂停挂在 showWordCard（卡片出现）而不是 mouseover：否则鼠标从列表挪到答案
+ *     上就把音频切得一顿一顿
+ *   - 续播延迟 400ms：A 词划到 B 词要经过标点，立刻续播会漏出半秒声音
+ *   - 用户自己点播放/暂停后清掉约定：否则手动暂停完，移开鼠标又被自动播起来
+ */
+check(
+  'panel.ts(页面): 悬停查词在卡片出现时暂停（不是一 hover 就暂停）',
+  /function showWordCard\(tokEl, info\) \{[\s\S]{0,320}pauseForLook\('hover'\)/.test(panel) &&
+    /function pauseForLook\(kind\)[\s\S]{0,300}if \(player\.paused\) return;/.test(panel),
+  '悬停即暂停会让鼠标路过答案区时音频一顿一顿；没在播时也不该记暂停原因'
+);
+check(
+  'panel.ts(页面): 点词选中 → 暂停且不自动续播（移开鼠标也不播）',
+  /el\.onclick = \(\) => \{[\s\S]{0,220}pauseForLook\('select'\)/.test(panel) &&
+    /if \(lookPause === 'hover' && kind === 'select'\) \{ lookPause = 'select'; return; \}/.test(panel) &&
+    /function resumeAfterLook\(\) \{\s*\n\s*if \(lookPause !== 'hover'\) return;/.test(panel),
+  '选中态没盖掉悬浮态：移开鼠标会把用户刚刚停下来的音频又播起来'
+);
+check(
+  'panel.ts(页面): 移开词后延迟 400ms 续播（A 词划到 B 词不漏音）',
+  /wcResumeTimer = setTimeout\(\(\) => \{[\s\S]{0,120}\}, 400\);/.test(panel) &&
+    /if \(!tok\) \{[\s\S]{0,200}scheduleLookResume\(\);/.test(panel) &&
+    /cancelLookResume\(\);\s*\n\s*\n\s*const word = \(tok\.textContent/.test(panel),
+  '立刻续播会漏出半秒声音；停在另一个词上时又不该把待续播的定时器留着'
+);
+check(
+  'panel.ts(页面): 用户自己播放/暂停后作废「查词暂停」的恢复约定',
+  /function togglePlayPause\(\) \{[\s\S]{0,260}lookPause = null;/.test(panel) &&
+    /async function playCurrent\(\) \{[\s\S]{0,220}lookPause = null;/.test(panel),
+  '手动暂停后移开鼠标，音频会自己又播起来'
+);
 check(
   'panel.ts: 精听快捷键 a/d/空格/w/s（与按钮共用动作函数，输入框聚焦时不抢键）',
   /function (gotoPrev|gotoNext|togglePlayPause|cyclePlayMode|cycleRate)/.test(panel) &&

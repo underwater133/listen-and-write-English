@@ -3999,6 +3999,10 @@ function gotoNext() {
 }
 
 function togglePlayPause() {
+  // 用户自己动了播放器 → 取消「查词暂停」的恢复约定，
+  // 否则手动暂停后移开鼠标，音频会自己又播起来
+  lookPause = null;
+  cancelLookResume();
   if (!player.paused) { player.pause(); return; }
   const m = state.material;
   const s = m && m.sentences[state.currentIndex];
@@ -4523,14 +4527,59 @@ function closeWordCard() {
   if (wcTimer) { clearTimeout(wcTimer); wcTimer = null; }
   wcTok = null;
   wcPending = 0;
-  if (!wordCardEl) return;
-  wordCardEl.classList.remove('open');
-  wordCardEl.innerHTML = '';
+  if (wordCardEl) {
+    wordCardEl.classList.remove('open');
+    wordCardEl.innerHTML = '';
+  }
+  // 卡片收起 = 悬浮结束，延迟续播（只对「因悬浮而暂停」生效）
+  scheduleLookResume();
+}
+
+/* ---- 查词让路：悬浮/选中时暂停播放 ----
+ * 悬浮 → 卡片真的出现的那一刻才暂停。250ms 的悬停延迟顺带过滤掉「鼠标路过」，
+ * 否则光是把鼠标从字幕列表挪到答案上，音频就会一顿一顿的。
+ * 移开 → 延迟 400ms 再续播：从 A 词划到 B 词要经过中间的标点/空格，
+ * 立刻续播会漏出半秒声音、随即又被下一个词的卡片打断。
+ * 选中（点词）→ 永不自动续播，等用户自己点播放：那是明确的「我要停下来看」。
+ */
+let lookPause = null;      // null | 'hover' | 'select'
+let wcResumeTimer = null;  // 延迟续播计时器
+
+function cancelLookResume() {
+  if (wcResumeTimer) { clearTimeout(wcResumeTimer); wcResumeTimer = null; }
+}
+
+/** 记下这次暂停的原因；本来就没在播就什么都不做（也就没有要恢复的东西） */
+function pauseForLook(kind) {
+  cancelLookResume();
+  // 已经因悬浮暂停时又点了词 → 升级成「选中」，否则移开鼠标会自己续播
+  if (lookPause === 'hover' && kind === 'select') { lookPause = 'select'; return; }
+  if (player.paused) return;
+  lookPause = kind;
+  try { player.pause(); } catch (e) { /* 播放器未初始化时忽略 */ }
+}
+
+/** 只恢复「因悬浮而暂停」的那一次；选中导致的不恢复 */
+function resumeAfterLook() {
+  if (lookPause !== 'hover') return;
+  lookPause = null;
+  if (player.paused) player.play().catch(() => {});
+}
+
+function scheduleLookResume() {
+  if (lookPause !== 'hover') return;
+  cancelLookResume();
+  wcResumeTimer = setTimeout(() => {
+    wcResumeTimer = null;
+    resumeAfterLook();
+  }, 400);
 }
 
 /** info = { word, found, phonetic, translation, base } */
 function showWordCard(tokEl, info) {
   if (!wordCardEl || !tokEl || !tokEl.isConnected) return;
+  // 卡片真要弹出来才算「正在查词」：这时暂停播放，读完移开再续上
+  pauseForLook('hover');
   let html = '<div class="wc-head">' + esc(info.word || '');
   if (info.base) html += ' <span class="wc-base">→ ' + esc(info.base) + '</span>';
   html += '</div>';
@@ -4580,7 +4629,13 @@ document.addEventListener('mouseover', (e) => {
   wcPending = 0; // 换词后旧回包一律作废
   if (wcTimer) { clearTimeout(wcTimer); wcTimer = null; }
   if (wordCardEl) wordCardEl.classList.remove('open');
-  if (!tok) return;
+  if (!tok) {
+    // 离开词（标点 / 空白 / 别的控件）：延迟续播，避免 A→B 途中漏出半秒声音
+    scheduleLookResume();
+    return;
+  }
+  // 停在另一个词上：上一次的暂停继续有效，别让待续播的定时器把它接回去
+  cancelLookResume();
 
   const word = (tok.textContent || '').trim();
   if (!word) return;
@@ -5681,6 +5736,8 @@ function renderPractice() {
   // 例外：点在已收藏的短语/整句里 → 整块选中，只能整体取消（见 favUnitAt）。
   document.querySelectorAll('#answerBox .tok').forEach((el) => {
     el.onclick = () => {
+      // 点词 = 「我要停下来看这句」：暂停播放，且移开鼠标也不自动续播
+      pauseForLook('select');
       const wi = Number(el.dataset.tok);
       if (state.favSelFor !== i) { state.favSelFor = i; state.favSel = []; }
 
@@ -6060,6 +6117,9 @@ function loadIntoPlayer(url) {
 }
 
 async function playCurrent() {
+  // 主动播放（按钮 / 快捷键 / 连播推进）一律作废「查词暂停」的恢复约定
+  lookPause = null;
+  cancelLookResume();
   const m = state.material;
   const s = m && m.sentences[state.currentIndex];
   if (!s) return;
