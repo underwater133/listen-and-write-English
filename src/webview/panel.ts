@@ -1084,6 +1084,33 @@ export class PracticePanel {
         this.pushFavorites();
         break;
 
+      /* ---------------- 答案卡悬停查词（本地离线词典） ----------------
+       * 悬停才查、不缓存：页面每次悬停发一条，这里只做一次内存 Map 查询。
+       * 回包带 reqId，页面据此丢弃过期回包（快速划过多个词时防串台）。 */
+      case 'lookupWord': {
+        const reqId = Number(msg.reqId) || 0;
+        const word = String(msg.word ?? '').trim().slice(0, 64);
+        const entry = word
+          ? await getDictionary(this.deps.dictPath).lookup(word)
+          : null;
+        this.webview.postMessage({
+          type: 'wordInfo',
+          reqId,
+          word,
+          found: !!entry,
+          phonetic: entry ? entry.phonetic : '',
+          translation: entry ? entry.translation : '',
+          base: entry?.base ?? '',
+        });
+        break;
+      }
+
+      // 「看答案」展开后由页面触发：只把词典解压进内存（约 200-300ms），
+      // 让首次悬停不用等这一步。查不查词仍由页面决定。
+      case 'warmDict':
+        getDictionary(this.deps.dictPath).warm().catch(() => {});
+        break;
+
       /* ---------------- 复习（收藏单词的间隔重复） ---------------- */
 
       case 'reviewListRequest':
@@ -2516,6 +2543,29 @@ export class PracticePanel {
   .lib-menu .msep { height: 1px; background: var(--border); margin: 4px 2px; }
   .lib-menu .mi .tick { width: 10px; color: var(--accent); }
 
+  /* ---- 答案卡悬停释义：全局单例、fixed 定位 ----
+   * 与 .lib-menu 同理必须挂在 body 下：答案卡在 overflow-y:auto 的 .practice 里，
+   * absolute 定位会被容器裁掉。pointer-events:none 让鼠标直接穿过去，
+   * 不影响底下的点词选中 / 相邻扩展短语。 */
+  .word-card {
+    display: none; position: fixed; z-index: 60;
+    /* 侧边栏只有 300px 左右，卡片不能撑破视口 */
+    max-width: min(320px, calc(100vw - 24px));
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 4px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.28);
+    padding: 6px 9px; font-size: 12px; line-height: 1.5;
+    pointer-events: none;
+  }
+  .word-card.open { display: block; }
+  /* 标题：原词 / 「原词 → 原形」；箭头部分弱化，主词形才是主角 */
+  .word-card .wc-head { font-weight: 600; }
+  .word-card .wc-base { color: var(--muted); font-weight: 400; }
+  .word-card .wc-phon { color: var(--muted); font-size: 11px; margin-top: 1px; }
+  /* ECDICT 释义自带换行（词性分行），原样保留，不合并成一段 */
+  .word-card .wc-def { margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .word-card .wc-none { color: var(--muted); margin-top: 2px; }
+
   /* 精听页标题下的标记行（难度 + 已学完） */
   .lib-flags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 4px; }
   .lib-flags button { padding: 1px 7px; font-size: 11px; }
@@ -2641,6 +2691,9 @@ export class PracticePanel {
 <!-- 素材「⋯」菜单：全局单例。挂在 body 下才能用 fixed 定位，
      放进 #library 会被它的 overflow-y:auto 裁掉。 -->
 <div id="libMenu" class="lib-menu"></div>
+
+<!-- 答案卡悬停释义：全局单例，同样挂在 body 下（理由同上） -->
+<div id="wordCard" class="word-card"></div>
 
 <script>
 const vscode = acquireVsCodeApi();
@@ -2901,6 +2954,14 @@ window.addEventListener('message', (e) => {
       translation: msg.translation || '',
     };
     if (currentView === 'favorites') renderFavView();
+  }
+  // 答案卡悬停查词回包（宿主本地离线词典）。只认「当前还悬停着的那一个词」：
+  // reqId 对不上说明用户已经划走了，直接丢弃 —— 否则快速划过两个词会串台。
+  if (msg.type === 'wordInfo') {
+    if (msg.reqId && msg.reqId === wcPending && wcTok && wcTok.isConnected) {
+      wcPending = 0;
+      showWordCard(wcTok, msg);
+    }
   }
   // 例句播放：宿主解析出音频地址与句段起止，复用主 player 播放，到句尾自动停。
   // ⚠️ 必须走 ensurePlayerSource（宿主字节路线，MIME 随请求声明）：
@@ -4443,6 +4504,103 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* ---- 答案卡悬停释义 ----
+ * 语义：悬停 250ms 才向宿主查、不缓存、移出即消失。
+ * 「不缓存」的唯一例外是 wcTok —— 它只是「当前正悬停在哪一个 token 上」的
+ * 状态（防止同一个词上鼠标抖动时重复发请求），换词/换句/重建 DOM 即失效，
+ * 不保留任何查过的结果。
+ * 词典在宿主进程里（本地离线），单次查询 1-3ms；首次解压由 warmDict 预热。
+ */
+const wordCardEl = document.getElementById('wordCard');
+const WC_HOVER_DELAY = 250;
+let wcTimer = null;   // 悬停延迟计时器
+let wcTok = null;     // 当前悬停的 token 元素（非缓存，见上）
+let wcReqId = 0;      // 请求号自增
+let wcPending = 0;    // 正在等回包的请求号（0 = 没有在等）
+let dictWarmRequested = false; // 词典预热只发一次（进程内共享一份）
+
+function closeWordCard() {
+  if (wcTimer) { clearTimeout(wcTimer); wcTimer = null; }
+  wcTok = null;
+  wcPending = 0;
+  if (!wordCardEl) return;
+  wordCardEl.classList.remove('open');
+  wordCardEl.innerHTML = '';
+}
+
+/** info = { word, found, phonetic, translation, base } */
+function showWordCard(tokEl, info) {
+  if (!wordCardEl || !tokEl || !tokEl.isConnected) return;
+  let html = '<div class="wc-head">' + esc(info.word || '');
+  if (info.base) html += ' <span class="wc-base">→ ' + esc(info.base) + '</span>';
+  html += '</div>';
+  if (!info.found) {
+    html += '<div class="wc-none">本地词典未收录</div>';
+  } else {
+    // ECDICT 音标是旧式转写，重音用前导撇号表示（'hju:mәn）：去掉再套 /.../
+    const phon = String(info.phonetic || '').replace(/^'+/, '').trim();
+    if (phon) html += '<div class="wc-phon">/' + esc(phon) + '/</div>';
+    html += '<div class="wc-def">' + esc(info.translation || '') + '</div>';
+  }
+  wordCardEl.innerHTML = html;
+  wordCardEl.classList.add('open');
+
+  // 先挪到屏幕外量尺寸再定位：卡片高度随释义行数变化，写死数值必然错位
+  wordCardEl.style.left = '-9999px';
+  wordCardEl.style.top = '0px';
+  const r = tokEl.getBoundingClientRect();
+  const w = wordCardEl.offsetWidth;
+  const h = wordCardEl.offsetHeight;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // 水平：贴词居中，夹在视口内
+  let left = r.left + r.width / 2 - w / 2;
+  if (left + w > vw - 4) left = vw - 4 - w;
+  if (left < 4) left = 4;
+
+  // 垂直：优先词的正上方（不挡住正在读的句子）；上方不够翻到下方；
+  // 两边都不够就贴视口边缘 —— 极端长释义允许暂时盖住内容，移开即消失。
+  let top = r.top - h - 6;
+  if (top < 4) top = r.bottom + 6;
+  if (top + h > vh - 4) top = vh - 4 - h;
+  if (top < 4) top = 4;
+
+  wordCardEl.style.left = Math.round(left) + 'px';
+  wordCardEl.style.top = Math.round(top) + 'px';
+}
+
+// 事件委托在 document 上：答案卡每次点词都整页重建 DOM，
+// 逐个 token 绑监听会在重建后全部失效，且数量随句长增长。
+document.addEventListener('mouseover', (e) => {
+  const t = e.target;
+  const tok = t && t.closest ? t.closest('#answerBox .tok') : null;
+  if (tok === wcTok) return; // 同一个 token 上抖动：保持现状，不重复发请求
+  wcTok = tok;
+  wcPending = 0; // 换词后旧回包一律作废
+  if (wcTimer) { clearTimeout(wcTimer); wcTimer = null; }
+  if (wordCardEl) wordCardEl.classList.remove('open');
+  if (!tok) return;
+
+  const word = (tok.textContent || '').trim();
+  if (!word) return;
+  wcTimer = setTimeout(() => {
+    wcTimer = null;
+    if (wcTok !== tok) return; // 计时期间已经划走了
+    wcReqId++;
+    wcPending = wcReqId;
+    vscode.postMessage({ type: 'lookupWord', reqId: wcReqId, word });
+  }, WC_HOVER_DELAY);
+});
+
+// 鼠标移出 webview（进编辑器 / 别的面板）时没有 mouseover 可接，单独兜一层
+document.addEventListener('mouseout', (e) => {
+  if (!e.relatedTarget) closeWordCard();
+});
+// 卡片是 fixed 定位，滚动后与词错位，直接收起
+document.addEventListener('scroll', () => closeWordCard(), true);
+window.addEventListener('resize', () => closeWordCard());
+
 function renderLibBar() {
   const bar = document.getElementById('libBar');
   if (libState.multi) {
@@ -4966,6 +5124,10 @@ function render() {
   const newPractice = document.getElementById('practice');
   if (newPractice && sameIndex) newPractice.scrollTop = prevPracticeScroll;
   renderedIndex = state.currentIndex;
+
+  // 整页重建会把答案卡里的 token 全部销毁：悬停态必须一起清掉，
+  // 否则卡片会继续指着一个已经不在文档里的元素（点词选中 → 重建 → 卡片悬空）。
+  closeWordCard();
 }
 
 function renderList() {
@@ -5340,6 +5502,14 @@ function renderPractice() {
   const i = state.currentIndex;
   const s = m.sentences[i];
   if (!s) return;
+
+  // 答案已经展示出来了 → 提前把离线词典解压进宿主内存（约 200-300ms）。
+  // 放在这里而不是等首次悬停：否则第一次悬停会先顿 0.3 秒才出卡，最容易被
+  // 当成「功能坏了」。延迟 300ms 是为了避开这次渲染本身，只发一次（宿主内共享）。
+  if (state.revealAnswer && !dictWarmRequested) {
+    dictWarmRequested = true;
+    setTimeout(() => vscode.postMessage({ type: 'warmDict' }), 300);
+  }
 
   // 连播切句会整体重建 DOM —— 先记住输入框当前有没有焦点、光标在哪，
   // 重建后原样恢复。不恢复的话，即使「连播不抢焦点」，用户自己点进

@@ -18,6 +18,11 @@ import * as zlib from 'zlib';
 export interface DictEntry {
   phonetic: string;
   translation: string;
+  /**
+   * 命中变形词时给出词表里的原形（went → go）；精确命中自身词条时为空。
+   * 供答案卡悬停释义展示「went → go」用。
+   */
+  base?: string;
 }
 
 /** 侧边栏与编辑器面板是两个实例，词典按路径共享单例（避免双份内存） */
@@ -60,6 +65,11 @@ export class Dictionary {
     await this.loading;
   }
 
+  /** 预热：只触发加载（首次 gunzip 约 200-300ms），不做查询。失败静默 */
+  async warm(): Promise<void> {
+    await this.ensureLoaded();
+  }
+
   /** 词形还原后查询。未命中返回 null（调用方决定是否走百度兜底） */
   async lookup(word: string): Promise<DictEntry | null> {
     await this.ensureLoaded();
@@ -68,17 +78,17 @@ export class Dictionary {
     const w = word.trim();
     if (!w || /\s/.test(w)) return null; // 短语不查词典（调用方也不该传）
 
-    // 1) 精确 / 小写
+    // 1) 精确 / 小写（自己就是词条，没有原形可标注）
     for (const c of [w, w.toLowerCase()]) {
       const hit = this.words.get(c);
-      if (hit) return this.mk(hit);
+      if (hit) return this.mk(hit, w);
     }
     // 2) lemma 反转映射（不规则变形：went→go、humans→human）
     for (const c of [w, w.toLowerCase()]) {
       const base = this.lemma.get(c) ?? this.lemma.get(c.toLowerCase());
       if (base) {
         const hit = this.words.get(base);
-        if (hit) return this.mk(hit);
+        if (hit) return this.mk(hit, w, base);
       }
     }
     // 3) 规则剥离兜底（covers 词典 exchange 没收录的生僻变形）
@@ -86,14 +96,18 @@ export class Dictionary {
       for (const stem of stripSuffixes(c)) {
         const base = this.lemma.get(stem) ?? stem;
         const hit = this.words.get(base);
-        if (hit) return this.mk(hit);
+        if (hit) return this.mk(hit, w, base);
       }
     }
     return null;
   }
 
-  private mk(hit: [string, string]): DictEntry {
-    return { phonetic: hit[0], translation: hit[1] };
+  /** query = 用户查的原始词形；base = 实际命中的词条（不同则说明走了词形还原） */
+  private mk(hit: [string, string], query: string, base?: string): DictEntry {
+    const entry: DictEntry = { phonetic: hit[0], translation: hit[1] };
+    // 只差大小写的「原形」不值得标箭头（went→go 才有信息量）
+    if (base && base.toLowerCase() !== query.toLowerCase()) entry.base = base;
+    return entry;
   }
 }
 

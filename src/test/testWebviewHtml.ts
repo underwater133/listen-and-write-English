@@ -834,6 +834,70 @@ check(
     fs.existsSync(path.join(__dirname, '../../assets/dict.json.gz')),
   '词典数据或构建脚本缺失，离线查词会全部走百度'
 );
+
+/* ---------- 答案卡悬停释义（2026-11-02） ----------
+ * 交互约定：悬停 250ms 才查、不缓存、移出即消失。
+ *
+ * 下面每条挂了都是「看着能用、实际难用」的那类退化：
+ *   - 挂 body + fixed：放进答案卡会被 .practice 的 overflow 裁掉
+ *   - reqId 校验：回包顺序与悬停顺序无关，快速划过两个词会串台
+ *   - render() 末尾关卡片：点词选中会整页重建 DOM，卡片会指着已销毁的 token
+ *   - pointer-events:none：卡片盖在词上会吃掉 click，点词选不中
+ */
+check(
+  'panel.ts: 悬停释义卡是挂在 body 下的全局单例（fixed 定位）',
+  /id="wordCard" class="word-card"/.test(panel) &&
+    /\.word-card \{[\s\S]{0,200}position: fixed/.test(panel),
+  '放进答案卡容器里会被 .practice 的 overflow-y:auto 裁掉'
+);
+check(
+  'panel.ts: 悬停卡 pointer-events:none（鼠标可穿过，不挡点词选中）',
+  /\.word-card \{[\s\S]{0,700}pointer-events: none/.test(panel),
+  '卡片会吃掉 click，点词选词 / 扩选短语失效'
+);
+check(
+  'panel.ts(宿主): 悬停查词走 lookupWord → wordInfo（本地词典，回包带 reqId）',
+  /case 'lookupWord'/.test(panel) &&
+    /type: 'wordInfo'/.test(panel) &&
+    /reqId,/.test(panel) &&
+    /getDictionary\(this\.deps\.dictPath\)\.lookup\(word\)/.test(panel),
+  '没有查词通道，或回包不带 reqId（页面无法丢弃过期回包）'
+);
+check(
+  'panel.ts(宿主): 查词不落盘、不走百度（悬停是高频动作，不能占 QPS=1 的队列）',
+  !/case 'lookupWord'[\s\S]{0,400}baidu/.test(panel),
+  '悬停查词接进了百度队列，几个词就能把翻译通道堵死'
+);
+check(
+  'panel.ts(页面): 悬停延迟 250ms + 同一 token 不重复请求（不做结果缓存）',
+  /WC_HOVER_DELAY = 250/.test(panel) &&
+    /if \(tok === wcTok\) return;/.test(panel) &&
+    !/wordCache|wcCache/.test(panel),
+  '又加回了结果缓存，或同一词上抖动会重复发请求'
+);
+check(
+  'panel.ts(页面): 回包按 reqId 校验（快速划过两个词不会串台）',
+  /msg\.reqId === wcPending/.test(panel) &&
+    /wcTok && wcTok\.isConnected/.test(panel),
+  '不校验回包归属，悬停 A 却弹出 B 的释义'
+);
+check(
+  'panel.ts(页面): render() 结束时关闭悬停卡（重建 DOM 后不留悬空卡片）',
+  /renderedIndex = state\.currentIndex;[\s\S]{0,400}closeWordCard\(\);/.test(panel),
+  '点词选中会整页重建 DOM，卡片会指着一个已销毁的元素'
+);
+check(
+  'panel.ts(页面): 看答案展开后预热词典（不与首次悬停抢那 200-300ms 解压）',
+  /type: 'warmDict'/.test(panel) &&
+    /case 'warmDict'/.test(panel) &&
+    /dictWarmRequested/.test(panel),
+  '首次悬停要先等词典解压，表现为「悬停 0.3 秒才出卡」'
+);
+check(
+  'dictionary.ts: lookup 命中变形词时回传原形（went → go）',
+  /entry\.base = base/.test(dictSrc) && /base\?: string/.test(dictSrc),
+  '没有原形信息，悬停 went 只能看到 go 的释义，看不出是哪个词'
+);
 check(
   'panel.ts: 精听快捷键 a/d/空格/w/s（与按钮共用动作函数，输入框聚焦时不抢键）',
   /function (gotoPrev|gotoNext|togglePlayPause|cyclePlayMode|cycleRate)/.test(panel) &&
