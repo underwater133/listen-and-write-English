@@ -1873,7 +1873,29 @@ export class PracticePanel {
         });
       });
 
-      this.loadMaterial(ready);
+      /**
+       * ★ 下载完成的收尾：不能无条件抢占「当前正在练的素材」（2026-11-02 修复）
+       *
+       * 事故现场：「发现页」连下两个素材，用户点第一个的「练习」进了精听页，
+       *   第二个下载跑完后本页的 state.material 被换成第二个 —— 精听内容当场
+       *   变样、进度还被重置回第 1 句。根因就是这里无条件 loadMaterial()。
+       *
+       * 判定规则：
+       *   - 列表里发起的下载（origin='discover'）只负责「落盘 + 把卡片标成已下载」；
+       *   - 仅当宿主当前【没有素材】（没什么可被抢的）或【就是同一个素材】
+       *     （重新下载要刷新时间轴）时才真正装进页面；
+       *   - 否则让位给用户正在练的素材：一句提示都不弹，静默完成，
+       *     卡片自然会变成「已下载」（tedDownloaded 照发）。
+       */
+      const isDiscover = opts?.origin === 'discover';
+      const sameAsCurrent =
+        !!this.material?.cacheDir &&
+        !!ready.cacheDir &&
+        path.basename(this.material.cacheDir) === path.basename(ready.cacheDir);
+      if (!isDiscover || !this.material || sameAsCurrent) {
+        this.loadMaterial(ready);
+      }
+
       this.webview.postMessage({ type: 'progress', message: '就绪', percent: 100, ...ctx });
       this.webview.postMessage({ type: 'done', ...ctx });
 
