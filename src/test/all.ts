@@ -9,6 +9,7 @@ const suites = [
   ['testCacheGuard', '缓存自检逻辑'],
   ['testMp4', 'MP4 封装器'],
   ['testReview', '复习（间隔重复）调度与存储'],
+  ['testLearn', '词库（新学单词）进度与游标'],
 ];
 
 let totalPass = 0, totalFail = 0, allOk = true;

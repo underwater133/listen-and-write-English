@@ -31,6 +31,16 @@ export interface FavoriteContext {
   dirName?: string;
 }
 
+/**
+ * 收藏来源。
+ *   listening = 精听界面（看答案面板里点的词/短语/整句）
+ *   wordlist  = 「词库」刷词时收藏的词（没有例句、没有课程上下文）
+ *
+ * ⚠️ 旧数据没有这个字段：读的时候统一补成 'listening' 并原样写回，
+ *    不做单独的迁移脚本（迁移脚本只跑一次，而这里是每次读都兜底）。
+ */
+export type FavoriteSource = 'listening' | 'wordlist';
+
 export interface FavoriteEntry {
   id: string;
   type: FavoriteType;
@@ -40,6 +50,8 @@ export interface FavoriteEntry {
   pending: boolean;
   context: FavoriteContext;
   createdAt: number;
+  /** 来源（旧数据缺省 = listening）；收藏列表据此显示「词库」徽章 */
+  source?: FavoriteSource;
 }
 
 const BAIDU_ENDPOINT = 'https://fanyi-api.baidu.com/api/trans/vip/translate';
@@ -182,7 +194,13 @@ export class FavoriteStore {
     if (!fs.existsSync(this.file)) return [];
     try {
       const data = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-      return Array.isArray(data?.items) ? data.items : [];
+      if (!Array.isArray(data?.items)) return [];
+      // 旧数据没有 source：统一补 'listening'（旧数据全部来自精听界面的看答案面板）。
+      // 这里只补内存值，落盘交给下一次 save —— 只读路径不该产生写操作。
+      return data.items.map((x: FavoriteEntry) => ({
+        ...x,
+        source: x?.source === 'wordlist' ? 'wordlist' : 'listening',
+      }));
     } catch {
       return [];
     }

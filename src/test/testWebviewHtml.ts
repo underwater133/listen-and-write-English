@@ -1570,6 +1570,168 @@ check(
   '把 nowrap 写在共用的 .lib-card .meta 上，收藏卡片的译文会被截断'
 );
 
+/* ---------- 「词库」新学单词（0.1.7） ----------
+ * 设计约定（拷问清单）：
+ *   - 单词/音标/释义一次全给，没有翻面（这是刷词不是自测）
+ *   - 只有「收藏 / 下一个」两个动作；收藏标 source=wordlist，与精听来源区分
+ *   - 进度存 stats/vocab.json（锚词），既不能污染素材 learn.json，也要能跟着迁移
+ *   - TTS 走系统语音：缺哪个口音就把那个按钮置灰，绝不拿别的口音冒充
+ */
+const learnSrc = fs.readFileSync(path.join(__dirname, '../../src/core/learn.ts'), 'utf8');
+
+check(
+  'panel.ts(页面): 词库视图接进导航（learnBtn / learnView / renderLearnView）',
+  /id="learnBtn"/.test(panel) &&
+    /id="learnView"/.test(panel) &&
+    /function renderLearnView/.test(panel) &&
+    /learn: learnView/.test(panel) &&
+    /learn: document\.getElementById\('learnBtn'\)/.test(panel),
+  '词库视图没接进导航'
+);
+check(
+  'panel.ts(宿主): 词库通道齐全 learnInit / learnNext / learnFav / learnReset',
+  /case 'learnInit'/.test(panel) &&
+    /case 'learnNext'/.test(panel) &&
+    /case 'learnFav'/.test(panel) &&
+    /case 'learnReset'/.test(panel),
+  'webview 与宿主的词库消息没接全'
+);
+const learnFavBlock = (() => {
+  const i = panel.indexOf("case 'learnFav'");
+  const j = panel.indexOf("case 'favRetry'", i);
+  return i >= 0 && j > i ? panel.slice(i, j) : '';
+})();
+check(
+  'panel.ts(宿主): 词库收藏不发百度翻译（音标释义来自离线词典）',
+  !!learnFavBlock && !/buildBaidu|enqueueFavTranslation|baiduTranslate/.test(learnFavBlock),
+  '词库收藏走了翻译队列：卡片上的释义已经来自词典，纯属浪费额度'
+);
+check(
+  'panel.ts(页面): 卡片不翻面（单词 / 音标 / 释义同屏）',
+  /class="lw-word"/.test(panel) && /class="lw-ph"/.test(panel) && /class="lw-trans"/.test(panel),
+  '缺字段或又做成了翻面卡'
+);
+check(
+  'panel.ts(页面): 动作按钮 = 上一个 / 下一个 + 右上角星标收藏 + 重置进度入口',
+  /id="lwPrev"/.test(panel) && /id="lwNext"/.test(panel) &&
+    /lw-favbtn/.test(panel) && /id="lwReset"/.test(panel),
+  '收藏按钮不在卡片右上角，或动作按钮缺失'
+);
+check(
+  'panel.ts(收藏开关): 星标可取消收藏、回执前防连点，宿主按词形反查删除且回执带回状态',
+  /type: state\.lwFaved \? 'learnFav' : 'learnUnfav'/.test(panel) &&
+    /if \(!c \|\| state\.lwFavBusy\) return;/.test(panel) &&
+    /case 'learnUnfav'/.test(panel) &&
+    /reviewKey\(f\.text\) === key/.test(panel) &&
+    /msg\.faved !== false/.test(panel) &&
+    /state\.lwFavBusy = false/.test(panel),
+  '收藏不可就地取消、连点会闪烁星星，或取消后状态不同步'
+);
+check(
+  'panel.ts(页面): 重置进度是原地二次确认（不弹 confirm）',
+  /lwResetArmed/.test(panel) && /确认重置/.test(panel),
+  '重置没有二次确认，误点就丢进度'
+);
+check(
+  'panel.ts(页面): 跳过开关默认开（已收藏/已掌握不再出现在词库里）',
+  /lwSkipFav: true/.test(panel) && /id="lwSkip"/.test(panel) && /type: 'learnInit', skipFav/.test(panel),
+  '刷词会反复撞见已经收藏过的词'
+);
+check(
+  'panel.ts: 自动发音（出新卡读默认口音，勾选开关写回 vocabAutoSpeak 配置）',
+  /vocabAutoSpeak/.test(panel) &&
+    /id="lwAuto"/.test(panel) &&
+    /if \(currentView === 'learn' && state\.lwAuto\) ttsSpeak\(lwAccent\);/.test(panel) &&
+    /type: 'learnAutoPlay', on: state\.lwAuto/.test(panel) &&
+    /case 'learnAutoPlay'/.test(panel) &&
+    /\.update\('vocabAutoSpeak', !!msg\.on, vscode\.ConfigurationTarget\.Global\)/.test(panel),
+  '自动发音缺失、不该播的时候乱播，或开关不持久化'
+);
+check(
+  'panel.ts(页面): TTS 语音列表异步获取（voiceschanged + 轮询兜底）',
+  /voiceschanged/.test(panel) && /ttsTries/.test(panel),
+  'Electron 下 getVoices() 是异步的，不轮询会永远判成"无语音"'
+);
+check(
+  'panel.ts(页面): 缺对应口音时按钮置灰（不拿另一种口音冒充）',
+  /const usOk = !!ttsPick\('us'\)/.test(panel) && /\(gbOk \? '' : ' disabled'\)/.test(panel),
+  '英音缺失时用美音顶替 = 发音错误'
+);
+check(
+  'panel.ts(词库快捷键): a/d 翻卡、空格发音、1/2 口音、f 收藏，且与按钮共用动作函数',
+  /case ' ': e\.preventDefault\(\); ttsSpeak\(lwAccent\); break;/.test(panel) &&
+    /case '1': ttsSpeak\('gb'\); break;/.test(panel) &&
+    /case '2': ttsSpeak\('us'\); break;/.test(panel) &&
+    /case 'a': case 'A': case 'ArrowLeft': e\.preventDefault\(\); lwGo\(-1\); break;/.test(panel) &&
+    /case 'd': case 'D': case 'ArrowRight': case 'Enter': e\.preventDefault\(\); lwGo\(1\); break;/.test(panel) &&
+    /if \(pv\) pv\.onclick = \(\) => lwGo\(-1\)/.test(panel) &&
+    /if \(nx\) nx\.onclick = \(\) => lwGo\(1\)/.test(panel) &&
+    /if \(fav\) fav\.onclick = \(\) => lwFav\(\)/.test(panel),
+  '快捷键缺失，或与按钮各写一套逻辑'
+);
+check(
+  'panel.ts: 基础词过滤（宿主按 vocabSkipBasic 阈值跳过，页面有开关）',
+  /vocabSkipBasic/.test(panel) &&
+    /id="lwSkipBasic"/.test(panel) &&
+    /skipBasic: !!msg\.skipBasic/.test(panel),
+  'a/the/of 这类超高频词没有过滤入口'
+);
+check(
+  'panel.ts(宿主): learnPrev 回看通道存在，回看不改「已学」且保留 frontier（save 全量重写会吞字段）',
+  /case 'learnPrev'/.test(panel) && /opts\.prev/.test(panel) &&
+    /frontier: prog\.frontier,/.test(panel) && /learned: prog\.learned,/.test(panel),
+  '回看会把「已学」/frontier 冲掉，来回切虚增 bug 复发'
+);
+check(
+  'panel.ts(词库快捷键): 只在词库视图且输入框聚焦/按住不放时不响应',
+  /currentView !== 'learn'\) return;/.test(panel) &&
+    /if \(!state\.lwCard\) return;/.test(panel) &&
+    /if \(e\.repeat\) return;/.test(panel),
+  '缺守卫，按住 f 会连续收藏/按住空格会重复发音'
+);
+check(
+  'learn.ts: 进度锚点是词形而非下标（列表会因收藏增删而变长变短）',
+  /export function resumeIndex/.test(learnSrc) && /words\.indexOf\(anchor\)/.test(learnSrc),
+  '存下标会在跳过/取消收藏后漂移，续学跳到别的词上'
+);
+check(
+  'learn.ts: 刷到末尾返回 -1（页面据此显示"已刷完"）',
+  /return -1;/.test(learnSrc) && /learnEnd/.test(panel),
+  '没有结束态，用户会看到一张空白卡'
+);
+check(
+  'dictionary.ts: wordList 按词频升序，旧词典回退字母序',
+  /async wordList/.test(dictSrc) && /hasRank/.test(dictSrc) && /this\.list = kept/.test(dictSrc),
+  '词表不是"高频优先"，或对旧词典直接返回空表'
+);
+check(
+  'userdata.ts: vocab.json 已登记进用户数据清单（清缓存不删、换目录跟随迁移）',
+  /export const VOCAB_FILE = 'vocab\.json'/.test(udSrc) &&
+    /path\.join\(STATS_DIR, VOCAB_FILE\)/.test(udSrc),
+  'vocab.json 没进 USER_DATA_RELS，清缓存或改 materialsDir 会丢掉学习进度'
+);
+check(
+  'favorites.ts: 收藏带来源，旧数据读出来补成 listening',
+  /source\?: FavoriteSource/.test(favSrc) &&
+    /x\?\.source === 'wordlist' \? 'wordlist' : 'listening'/.test(favSrc),
+  '旧收藏没有来源标记，界面无法区分，也没法安全迁移'
+);
+check(
+  'panel.ts(收藏列表): 词库来源显示徽章，且不显示"来源：(未知课程)"',
+  /srcTag/.test(panel) && /badge src-wordlist/.test(panel) && /来源：词库/.test(panel),
+  '词库收藏的词在收藏列表里看起来像"来源不明"'
+);
+check(
+  'package.json: 有 ttsAccent 配置与 TTS 诊断命令',
+  /listenAndWrite\.ttsAccent/.test(pkg) && /listenAndWrite\.ttsDiagnose/.test(pkg),
+  '口音默认值不可配，或没有排查系统语音的入口'
+);
+check(
+  'panel.ts: 词卡样式独立（.lw-*，不改动复习卡 .rv-*）',
+  /\.lw-card \{/.test(panel) && /\.rv-card \{/.test(panel),
+  '把词库样式写到复习卡上，会连带改坏复习界面'
+);
+
 /* ---------- 结果 ---------- */
 
 console.log(`\n=== 结果: ${pass} 通过 / ${fail} 失败 ===`);

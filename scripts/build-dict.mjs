@@ -11,8 +11,15 @@
  *   按 frq 升序封顶 MAX_WORDS 条。TED 听写场景的词基本都在这个范围内。
  *
  * 输出（Q9 决策）：单个 gzip JSON，运行时惰性载入内存 Map：
- *   { v, count, words: { word: [phonetic, translation] }, lemma: { 变形: 原形 } }
+ *   { v, count, words: { word: [phonetic, translation, frq?] }, lemma: { 变形: 原形 } }
  * lemma 由 exchange 字段反转生成（Q11：构建期做精确映射，运行时再叠加规则剥离兜底）。
+ *
+ * v2（2026-11）新增可选的第三项 frq = 词频排名（越小越常用，COCA frq 优先、
+ * 缺失时退 BNC bnc；两者都没有 = 无词频，数组只有两项）。
+ * 「词库」功能按 frq 升序刷词，因此构建期必须把排名带出去 —— 运行时的选词
+ * 过滤只保留了"入没入选"，排序依据没保留过。
+ * 兼容：老版本扩展只读 [0]/[1]，多一项不受影响；新扩展读老词典时
+ * 取不到 frq 会退回字母序（见 core/dictionary.ts 的 wordList）。
  */
 
 import * as fs from 'node:fs';
@@ -64,7 +71,7 @@ const header = rows.next().value;
 const col = {};
 header.forEach((h, i) => (col[h.trim()] = i));
 
-/** word -> { frq, phonetic, translation }； lemma：变形 -> 原形（exchange 反转） */
+/** word -> { rank, phonetic, translation }； lemma：变形 -> 原形（exchange 反转） */
 const words = Object.create(null);
 const lemma = Object.create(null);
 let total = 0;
@@ -86,7 +93,10 @@ for (const row of rows) {
     .replace(/\\n/g, '\n')
     .trim();
   if (!translation) continue;
-  words[word] = { frq: frq || 999999, phonetic, translation };
+  // 排名：COCA 优先，缺失退 BNC（两者都是"越小越常用"的排名，量级相近，
+  // 混用只影响排序精度，不影响"高频在前"这一目标）；都为 0 = 无词频（仅考纲入选）
+  const rank = frq > 0 ? frq : (bnc > 0 ? bnc : 0);
+  words[word] = { rank, phonetic, translation };
 
   // exchange 反转：'p:went,d:gone,…' → lemma['went'] = word（'0' 是原形本身，跳过）
   const exchange = (row[col.exchange] || '').trim();
@@ -100,15 +110,19 @@ for (const row of rows) {
   }
 }
 
-// 词频升序封顶（frq 越小越常用；无词频的排最后）
+// 词频升序封顶（rank 越小越常用；无词频的排最后）
+const NO_RANK = Number.MAX_SAFE_INTEGER;
 const kept = Object.keys(words)
-  .sort((a, b) => words[a].frq - words[b].frq)
+  .sort((a, b) => (words[a].rank || NO_RANK) - (words[b].rank || NO_RANK))
   .slice(0, MAX_WORDS);
 const keptSet = new Set(kept);
 const outWords = {};
 for (const w of kept) {
   const it = words[w];
-  outWords[w] = [it.phonetic, it.translation];
+  // 无词频的只写两项：数组长度就是"有没有排名"的判据，运行时无需额外字段
+  outWords[w] = it.rank > 0
+    ? [it.phonetic, it.translation, it.rank]
+    : [it.phonetic, it.translation];
 }
 
 // lemma 只保留「原形也在词表里」的映射（变形词本身不必在词表）
@@ -117,7 +131,7 @@ for (const [inf, base] of Object.entries(lemma)) {
   if (keptSet.has(base)) outLemma[inf] = base;
 }
 
-const payload = { v: 1, count: kept.length, words: outWords, lemma: outLemma };
+const payload = { v: 2, count: kept.length, words: outWords, lemma: outLemma };
 const gz = zlib.gzipSync(Buffer.from(JSON.stringify(payload)), { level: 9 });
 
 const outDir = path.join(ROOT, 'assets');

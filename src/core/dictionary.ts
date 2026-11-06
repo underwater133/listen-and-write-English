@@ -2,7 +2,8 @@
  * 离线词典（ECDICT 子集，assets/dict.json.gz）
  *
  * 数据由 scripts/build-dict.mjs 从 ECDICT（MIT）构建：
- *   { v, count, words: { word: [phonetic, translation] }, lemma: { 变形: 原形 } }
+ *   { v, count, words: { word: [phonetic, translation, frq?] }, lemma: { 变形: 原形 } }
+ *   v2 起第三项是可选的词频排名（越小越常用）；老词典只有两项。
  *
  * 加载策略（Q9 决策）：单文件 gzip，首次查询时惰性解压载入内存 Map（约 200-300ms，
  * 仅一次），之后查询零成本。文件缺失/损坏 → 词典不可用，所有查询返回 null，
@@ -23,7 +24,15 @@ export interface DictEntry {
    * 供答案卡悬停释义展示「went → go」用。
    */
   base?: string;
+  /**
+   * 词频排名（构建期 COCA/BNC，越小越常用）。
+   * 0/undefined = 词典里没有这个词的排名，或读的是没有排名的旧版词典。
+   */
+  frq?: number;
 }
+
+/** 词典里的原始条目：[音标, 释义] 或 [音标, 释义, 词频排名] */
+type RawEntry = [string, string] | [string, string, number];
 
 /** 侧边栏与编辑器面板是两个实例，词典按路径共享单例（避免双份内存） */
 const instances = new Map<string, Dictionary>();
@@ -38,11 +47,13 @@ export function getDictionary(file: string): Dictionary {
 }
 
 export class Dictionary {
-  private words: Map<string, [string, string]> | null = null;
+  private words: Map<string, RawEntry> | null = null;
   private lemma: Map<string, string> | null = null;
   private loading: Promise<void> | null = null;
   /** false = 加载失败过（文件缺失/损坏），不再重试，查询恒返回 null */
   private broken = false;
+  /** 词库（学习）用的有序词表缓存，见 wordList() */
+  private list: string[] | null = null;
 
   constructor(private file: string) {}
 
@@ -68,6 +79,41 @@ export class Dictionary {
   /** 预热：只触发加载（首次 gunzip 约 200-300ms），不做查询。失败静默 */
   async warm(): Promise<void> {
     await this.ensureLoaded();
+  }
+
+  /**
+   * 「词库」用的有序词表（只给词形，释义按需 lookup）。
+   *
+   * 排序规则：
+   *   - 词典带词频（v2 及以后）→ 【只取有排名的词条】，按排名升序
+   *   - 旧词典没有排名 → 回退为全部词条的字母序（功能依旧可用，只是失去"高频优先"）
+   *
+   * ⚠️ 只返回词形而不是完整词条：15 万条 × {音标+释义} 的对象会白占几十 MB，
+   *    而刷词一次只看一条，用的时候再查就行。结果缓存一份（列表是只读的）。
+   */
+  async wordList(): Promise<string[]> {
+    await this.ensureLoaded();
+    if (!this.words) return [];
+    if (this.list) return this.list;
+    const all = Array.from(this.words.keys());
+    // 「有排名」= 该条目是三项数组且第三项 > 0
+    const hasRank = all.some((w) => this.rankOf(w) > 0);
+    const kept = hasRank ? all.filter((w) => this.rankOf(w) > 0) : all;
+    kept.sort((a, b) => {
+      const ra = this.rankOf(a);
+      const rb = this.rankOf(b);
+      if (ra !== rb) return ra - rb;
+      return a < b ? -1 : a > b ? 1 : 0;
+    });
+    this.list = kept;
+    return kept;
+  }
+
+  /** 词条的词频排名（0 = 无）；变形词不参与，只认词表里的原形 */
+  private rankOf(word: string): number {
+    const hit = this.words?.get(word);
+    const r = Number(hit?.[2]);
+    return Number.isFinite(r) && r > 0 ? r : 0;
   }
 
   /** 词形还原后查询。未命中返回 null（调用方决定是否走百度兜底） */
@@ -103,8 +149,10 @@ export class Dictionary {
   }
 
   /** query = 用户查的原始词形；base = 实际命中的词条（不同则说明走了词形还原） */
-  private mk(hit: [string, string], query: string, base?: string): DictEntry {
+  private mk(hit: RawEntry, query: string, base?: string): DictEntry {
     const entry: DictEntry = { phonetic: hit[0], translation: hit[1] };
+    const frq = Number(hit[2]);
+    if (Number.isFinite(frq) && frq > 0) entry.frq = frq;
     // 只差大小写的「原形」不值得标箭头（went→go 才有信息量）
     if (base && base.toLowerCase() !== query.toLowerCase()) entry.base = base;
     return entry;

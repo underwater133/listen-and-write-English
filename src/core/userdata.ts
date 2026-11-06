@@ -28,6 +28,12 @@ export const STATS_DIR = 'stats';
 export const MISTAKES_FILE = 'mistakes.jsonl';
 /** 复习进度文件名（同样位于 stats/ 下） */
 export const REVIEW_FILE = 'review.json';
+/**
+ * 「词库」学习进度文件名（stats/ 下）。
+ * ⚠️ 不要叫 learn.json：素材目录里每篇素材的标记文件（core/materialFlags.ts）
+ *    已经占了 learn.json 这个名字，同名会让人以为是同一份数据。
+ */
+export const VOCAB_FILE = 'vocab.json';
 
 /**
  * 素材根下属于「用户数据」的条目名 —— 清缓存时必须保留。
@@ -42,6 +48,7 @@ const USER_DATA_RELS = [
   FAVORITES_FILE,
   path.join(STATS_DIR, MISTAKES_FILE),
   path.join(STATS_DIR, REVIEW_FILE),
+  path.join(STATS_DIR, VOCAB_FILE),
 ];
 
 /**

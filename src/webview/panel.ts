@@ -42,6 +42,7 @@ import {
 import { isValidMp3 } from '../core/transcode';
 import { tedApiSearch, TedSort } from '../core/tedSearch';
 import { getDictionary } from '../core/dictionary';
+import { findNextIndex, LearnStore, resumeIndex } from '../core/learn';
 import {
   DAY_MS,
   DEFAULT_LADDER_TEXT,
@@ -263,8 +264,19 @@ export class PracticePanel {
   private readonly favs: FavoriteStore;
   /** 复习进度：用户数据，存素材根目录的 stats/review.json */
   private readonly reviews: ReviewStore;
+  /** 「词库」学习进度：用户数据，存素材根目录的 stats/vocab.json */
+  private readonly learns: LearnStore;
   /** 当前复习会话（内存态，见 ReviewSession 注释） */
   private reviewSession: ReviewSession | null = null;
+  /**
+   * 词库游标（词表下标）。null = 还没初始化，首次进词库视图时从进度锚词恢复。
+   * ⚠️ 只在内存里推进：每次推进都把锚词写进 vocab.json，切走/重开面板都能续上。
+   */
+  private learnCursor: number | null = null;
+  /** 词库是否跳过已收藏/已掌握的词（页面上的开关，随 learnInit 传上来） */
+  private learnSkipFav = true;
+  /** 词库是否跳过超高频基础词（the/of/I…，阈值见 vocabSkipBasic 配置） */
+  private learnSkipBasic = true;
   /** 百度翻译串行队列（标准版 QPS=1，队列内强制间隔） */
   private readonly tQueue = new TranslationQueue();
   /** 手动「更新翻译」批次剩余条数（>0 时 webview 显示进行中） */
@@ -365,6 +377,7 @@ export class PracticePanel {
     this.store = new MistakeStore(deps.cacheRoot);
     this.favs = new FavoriteStore(deps.cacheRoot);
     this.reviews = new ReviewStore(deps.cacheRoot);
+    this.learns = new LearnStore(deps.cacheRoot);
 
     this.webview.html = this.renderHtml();
 
@@ -439,6 +452,11 @@ export class PracticePanel {
   /** 离线词典查询（单例共享）。未命中/词典不可用返回 null，调用方走百度兜底 */
   private async lookupDict(word: string): Promise<{ phonetic: string; translation: string } | null> {
     return getDictionary(this.deps.dictPath).lookup(word);
+  }
+
+  /** 词库用的有序词表（词典内部已缓存，这里直接透传） */
+  private async learnWordList(): Promise<string[]> {
+    return getDictionary(this.deps.dictPath).wordList();
   }
 
   /**
@@ -691,6 +709,195 @@ export class PracticePanel {
     this.advanceReview();
   }
 
+
+  /* ---------------- 词库（新学单词） ---------------- */
+
+  /**
+   * 刷词时默认跳过的词形集合。
+   *
+   * 「已掌握」的词一定在收藏里（mastered 只对收藏词生效），所以只要遍历收藏
+   * 就够了；这里刻意不读 review.json —— 收藏被删而进度还在时，那个词在
+   * 词库里本来就该重新出现（用户已经把它的收藏关系断掉了）。
+   */
+  private learnSkipSet(): Set<string> {
+    const s = new Set<string>();
+    for (const f of this.favs.list()) {
+      if (f.type === 'word') s.add(reviewKey(f.text));
+    }
+    return s;
+  }
+
+  /**
+   * 下发当前游标处的词卡。
+   *
+   * 游标来源（按优先级）：
+   *   reset → 从头开始
+   *   内存游标已存在 → 用它（本次会话内连续刷词）
+   *   否则 → 从 vocab.json 的锚词恢复（重开面板 / 切走再回来）
+   *
+   * 跳过规则：已收藏（含已掌握）+ 超高频基础词（the/of/I…，见 vocabSkipBasic）
+   * + 缺音标或缺释义的脏词条。
+   * 「跳过开关」只影响往后的推进；「上一个」是回看，不受开关约束
+   * （往回找的是"你看过的词"，当时能看现在就能看）。
+   */
+  private async pushLearnCard(
+    opts: { reset?: boolean; prev?: boolean; skipFav?: boolean; skipBasic?: boolean } = {}
+  ): Promise<void> {
+    if (typeof opts.skipFav === 'boolean') this.learnSkipFav = opts.skipFav;
+    if (typeof opts.skipBasic === 'boolean') this.learnSkipBasic = opts.skipBasic;
+
+    if (opts.reset) {
+      this.learns.reset();
+      this.learnCursor = 0;
+    }
+    const words = await this.learnWordList();
+    if (!words.length) {
+      this.webview.postMessage({ type: 'learnEmpty' });
+      return;
+    }
+    const prog = this.learns.read();
+    if (this.learnCursor === null) this.learnCursor = resumeIndex(words, prog);
+    if (this.learnCursor >= words.length) {
+      // 刷到词表末尾：停在这里，重置/开关都能让用户重新有内容看
+      this.webview.postMessage({
+        type: 'learnEnd',
+        total: words.length,
+        learned: prog.learned,
+      });
+      return;
+    }
+
+    const skipSet = this.learnSkipFav ? this.learnSkipSet() : null;
+    const skip = (w: string) => !!skipSet && skipSet.has(reviewKey(w));
+    // 超高频基础词阈值（0 = 不过滤）：the/of/I 这类不用学，默认跳过排名前 1000
+    const basicMax = this.learnSkipBasic
+      ? vscode.workspace
+          .getConfiguration('listenAndWrite')
+          .get<number>('vocabSkipBasic', 500)
+      : 0;
+    const dict = getDictionary(this.deps.dictPath);
+
+    /** 脏词条（缺音标/释义）或超高频基础词都不可作为卡片 */
+    const usable = (e: { phonetic: string; translation: string; frq?: number } | null): boolean =>
+      !!e && !!e.phonetic.trim() && !!e.translation.trim() &&
+      !(basicMax > 0 && (e.frq ?? 0) > 0 && (e.frq ?? 0) <= basicMax);
+
+    let idx: number;
+    let entry: { phonetic: string; translation: string; frq?: number } | null = null;
+    if (opts.prev) {
+      /*
+       * 上一个：从游标前一个词【向前】找第一张能看的卡。
+       * 找不到（已到词表头）就停在第 0 张 —— 回看到头是正常操作，不是"结束"。
+       * ⚠️ 游标为 0 时直接走正向：回看没有内容，重发当前卡即可（按钮此时也应是禁用态）。
+       */
+      if (this.learnCursor <= 0) {
+        return this.pushLearnCard({ ...opts, prev: false });
+      }
+      idx = -1;
+      for (let i = Math.min(this.learnCursor - 1, words.length - 1); i >= 0; i--) {
+        if (skip(words[i])) continue;
+        const e = await dict.lookup(words[i]);
+        if (usable(e)) {
+          idx = i;
+          entry = e;
+          break;
+        }
+      }
+      if (idx < 0 || !entry) {
+        // 词表头之前全是跳过项：重发第 0 张（若第 0 张本身可看）
+        return this.pushLearnCard({ ...opts, prev: false });
+      }
+      // 回看不改「已学」计数、不动 frontier，只把锚词挪到它前面那个词
+      // —— 重开面板仍恢复到这一张。
+      // ⚠️ save 是全量重写：这里漏写 frontier 会把它清成空串，
+      //    下一次「下一个」就退回"每按一次 +1"的旧行为（来回切虚增 bug 复发）。
+      this.learnCursor = idx;
+      this.learns.save({
+        anchor: idx > 0 ? reviewKey(words[idx - 1]) : '',
+        learned: prog.learned,
+        frontier: prog.frontier,
+      });
+    } else {
+      /*
+       * 下一个：从游标起【向后】找第一张能看的卡。脏词条/基础词在这里被跳过 ——
+       * 卡片三个字段缺一个就很难看，而 ECDICT 里确实存在只有释义没音标的条目。
+       * ⚠️ 跳过必须推进游标，否则刷新一次又落回同一个脏词条，表现为「卡住不动」。
+       */
+      idx = findNextIndex(words, this.learnCursor, skip);
+      entry = idx >= 0 ? await dict.lookup(words[idx]) : null;
+      while (idx >= 0 && !usable(entry)) {
+        idx = findNextIndex(words, idx + 1, skip);
+        entry = idx >= 0 ? await dict.lookup(words[idx]) : null;
+      }
+      if (idx < 0 || !entry) {
+        this.learnCursor = words.length;
+        this.webview.postMessage({
+          type: 'learnEnd',
+          total: words.length,
+          learned: prog.learned,
+        });
+        return;
+      }
+    }
+
+    this.learnCursor = idx;
+    this.webview.postMessage({
+      type: 'learnCard',
+      card: {
+        word: words[idx],
+        phonetic: entry.phonetic,
+        translation: entry.translation,
+        frq: entry.frq ?? 0,
+      },
+      index: idx,
+      total: words.length,
+      learned: prog.learned,
+      skipFav: this.learnSkipFav,
+      skipBasic: this.learnSkipBasic,
+    });
+  }
+
+  /**
+   * 推进到下一张卡（dir=1）或回看上一张卡（dir=-1），并把"学到哪了"落盘。
+   *
+   * ⚠️ 「已学」只在越过 frontier（最前沿）时 +1：回看后往回刷、
+   *    或在已计数过的卡上原地重按都不计数（防"两个词来回切计数虚增"）。
+   * ⚠️ 侧边栏/编辑器面板两个实例共享 vocab.json，last-writer-wins：
+   *    同时在两边刷词理论上可能重复计数一次，可接受。
+   */
+  private async advanceLearn(dir: 1 | -1): Promise<void> {
+    const words = await this.learnWordList();
+    if (this.learnCursor === null || !words.length) {
+      await this.pushLearnCard();
+      return;
+    }
+    if (dir === -1) {
+      await this.pushLearnCard({ prev: true });
+      return;
+    }
+    const cur = this.learnCursor;
+    const word = words[cur];
+    const prog = this.learns.read();
+    if (word) {
+      const curKey = reviewKey(word);
+      /*
+       * 「已学」只在越过最前沿时 +1。
+       * frontier = 最后一次被计数的那张卡：cur > frontierIdx 才是新学 ——
+       * 回看后往回刷（cur < frontierIdx）或原地重按都不计数，
+       * 修复"两个词之间来回切，已学数字一直涨"的 bug。
+       * 旧数据没有 frontier 字段时 frontierIdx = -1，退回旧行为，随使用自动收敛。
+       */
+      const frontierIdx = prog.frontier ? words.indexOf(prog.frontier) : -1;
+      const beyond = cur > frontierIdx;
+      this.learns.save({
+        anchor: curKey,
+        learned: beyond ? prog.learned + 1 : prog.learned,
+        frontier: beyond ? curKey : prog.frontier,
+      });
+    }
+    this.learnCursor = cur + 1;
+    await this.pushLearnCard();
+  }
 
   /**
    * 把一条收藏排进百度翻译队列（单词/短语用）。
@@ -1050,6 +1257,8 @@ export class PracticePanel {
             sentenceIndex: Number.isFinite(idx) ? idx : 0,
             dirName,
           },
+          // 精听来源显式标注（旧数据没有这个字段，读的时候也会补成 listening）
+          source: 'listening',
         });
         // 查词管线：单词先查离线词典（音标+释义，本地零成本），未命中走百度；
         // 短语直接百度；整句译文已就绪（来自 TED 字幕）
@@ -1240,6 +1449,82 @@ export class PracticePanel {
         this.reviewSession = null;
         this.pushReviewHome();
         break;
+
+      /* ---------------- 词库（新学单词，不与复习排期耦合） ---------------- */
+
+      // 进入词库视图：每次重新从磁盘锚词恢复（另一个实例可能推进过了），
+      // 顺带把页面上的两个「跳过」开关带上来
+      case 'learnInit':
+        this.learnCursor = null;
+        await this.pushLearnCard({ skipFav: !!msg.skipFav, skipBasic: !!msg.skipBasic });
+        break;
+
+      case 'learnNext':
+        await this.advanceLearn(1);
+        break;
+
+      // 上一个：纯回看，不动「已学」计数
+      case 'learnPrev':
+        await this.advanceLearn(-1);
+        break;
+
+      case 'learnReset':
+        await this.pushLearnCard({ reset: true });
+        break;
+
+      // 自动发音开关：页面勾选 → 写回全局配置（重开面板/设置同步都记住）
+      case 'learnAutoPlay':
+        await vscode.workspace
+          .getConfiguration('listenAndWrite')
+          .update('vocabAutoSpeak', !!msg.on, vscode.ConfigurationTarget.Global);
+        break;
+
+      /*
+       * 词库里的收藏：释义/音标直接来自离线词典（卡片上已经显示了，
+       * 不再走百度翻译 —— 那些词本来就是词典里查出来的）。
+       * source 标成 wordlist，收藏列表据此显示「词库」徽章。
+       */
+      case 'learnFav': {
+        const word = String(msg.word ?? '').trim();
+        if (!word) break;
+        const entry = await this.lookupDict(word);
+        const { fav } = this.favs.add({
+          type: 'word',
+          text: word,
+          translation: entry?.translation ?? '',
+          pending: !entry,
+          // 刷词不绑任何素材：context 留空，收藏列表不会显示"来源：(未知课程)"
+          context: {
+            sentenceText: '',
+            sentenceTranslation: '',
+            talkTitle: '',
+            sourceUrl: '',
+            sentenceIndex: 0,
+          },
+          source: 'wordlist',
+        });
+        if (entry) this.favs.setPhonetic(fav.id, entry.phonetic);
+        this.pushFavorites();
+        this.webview.postMessage({ type: 'learnFavDone', word, id: fav.id, faved: true });
+        break;
+      }
+
+      // 取消收藏：按词形反查（reviewKey 归一化），只删词库来源以外的词型收藏也没关系
+      // —— 精听里收藏的同一个词本来就该算同一条，删掉是用户的明确意图
+      case 'learnUnfav': {
+        const word = String(msg.word ?? '').trim();
+        if (!word) break;
+        const key = reviewKey(word);
+        const target = this.favs
+          .list()
+          .find((f) => f.type === 'word' && reviewKey(f.text) === key);
+        if (target) {
+          this.favs.remove(target.id);
+          this.pushFavorites();
+        }
+        this.webview.postMessage({ type: 'learnFavDone', word, id: target?.id ?? null, faved: false });
+        break;
+      }
 
       case 'favRetry': {
         // 手动「更新翻译」：只在用户进入收藏界面点按钮时才补译（不自动跑），
@@ -2020,12 +2305,15 @@ export class PracticePanel {
    * 调用点：webview 就绪（case 'ready'）+ 配置变更（extension.ts 监听）。
    */
   pushConfig(): void {
+    const cfg = vscode.workspace.getConfiguration('listenAndWrite');
     this.webview.postMessage({
       type: 'config',
-      showAudioDiag: vscode.workspace
-        .getConfiguration('listenAndWrite')
-        .get<boolean>('showAudioDiagnostics', false),
+      showAudioDiag: cfg.get<boolean>('showAudioDiagnostics', false),
       baiduConfigured: this.isBaiduConfigured(),
+      // TTS 默认口音（词库卡片上「空格」播哪个）：us / gb
+      ttsAccent: cfg.get<string>('ttsAccent', 'gb') === 'us' ? 'us' : 'gb',
+      // 词库自动发音：出卡即读默认口音（页面上勾选开关，改动写回这个配置）
+      vocabAutoSpeak: cfg.get<boolean>('vocabAutoSpeak', true),
     });
   }
 
@@ -2432,6 +2720,55 @@ export class PracticePanel {
   }
   .rv-keys b { font-weight: 600; font-family: var(--vscode-editor-font-family, Consolas, monospace); }
 
+  /* ---- 「词库」新学单词（浏览式刷词，不进复习排期） ----
+   * 卡片与复习卡同源（单词大字号 + 音标 + 释义），但【不翻面】：
+   * 刷词的目的是"看一遍记住"，不是自测，信息一开始就全给。 */
+  .lw-top {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; color: var(--muted); flex: 0 0 auto;
+  }
+  .lw-count { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .lw-rank { margin-left: auto; white-space: nowrap; }
+  .lw-reset { padding: 0 6px; font-size: 10px; }
+  .lw-reset.armed { color: var(--err); border-color: var(--err); }
+  .lw-card {
+    flex: 0 0 auto; padding: 24px 12px 20px; text-align: center;
+    border: 1px solid var(--border); border-radius: 6px;
+  }
+  .lw-word { font-size: 28px; font-weight: 600; line-height: 1.3; word-break: break-word; }
+  .lw-ph {
+    margin-top: 8px; font-size: 12px; color: var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    gap: 6px; flex-wrap: wrap;
+  }
+  .lw-ph button { padding: 0 5px; font-size: 11px; line-height: 1.6; }
+  .lw-ph button:disabled { opacity: .45; cursor: default; }
+  .lw-trans {
+    margin-top: 12px; font-size: 13px; line-height: 1.7;
+    text-align: center; /* 与单词/音标对齐：卡片是"展示"不是"阅读"，居中更稳 */
+  }
+  .lw-card { position: relative; /* 星标收藏按钮要贴卡片右上角 */ }
+  .lw-favbtn {
+    position: absolute; top: 4px; right: 4px;
+    padding: 2px 10px; font-size: 15px; line-height: 1.4;
+    min-width: 0; flex: none;
+  }
+  .lw-favbtn.on { color: #f0b429; } /* 已收藏：实心星 + 金色 */
+  .lw-actions { flex: 0 0 auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .lw-actions button { flex: 1 1 auto; min-width: 70px; padding: 8px 6px; font-size: 12px; }
+  .lw-actions button:disabled { opacity: .45; cursor: default; }
+  .lw-keys {
+    flex: 0 0 auto; text-align: center;
+    font-size: 11px; line-height: 1.5; color: var(--muted); opacity: .85;
+  }
+  .lw-keys b { font-weight: 600; font-family: var(--vscode-editor-font-family, Consolas, monospace); }
+  .lw-foot {
+    flex: 0 0 auto; display: flex; align-items: center; justify-content: center;
+    gap: 14px; flex-wrap: wrap;
+    font-size: 11px; color: var(--muted);
+  }
+  .lw-foot label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
   /* ---- 「诊断报告」视图 ----
    * ⚠️ 报告必须是独立视图，不能写进 #root（练习界面）：
    *    历史事故（2026-09-19）——报告写进 #root 且不切视图，于是在「发现 TED」/
@@ -2513,6 +2850,11 @@ export class PracticePanel {
   /* 徽标靠 flex gap 排开，取消 .badge 自带的外边距免得间距翻倍 */
   .lib-tags .badge { margin-left: 0; }
   .badge.ok { color: var(--ok); border: 1px solid currentColor; }
+  /* 「词库」来源徽章：与精听来源区分（后者没有徽章，靠来源行的 talk 标题识别） */
+  .badge.src-wordlist {
+    color: var(--vscode-charts-blue, #3794ff);
+    border: 1px solid currentColor;
+  }
   .badge.no { color: var(--muted); border: 1px dashed currentColor; }
   .badge.d-easy { color: var(--ok); border: 1px solid currentColor; }
   .badge.d-medium { color: var(--warn); border: 1px solid currentColor; }
@@ -2640,6 +2982,8 @@ export class PracticePanel {
   <button id="libraryBtn" class="ghost">素材库</button>
   <button id="favBtn" class="ghost">收藏</button>
   <button id="reviewBtn" class="ghost">复习</button>
+  <!-- 词库：从离线词典按词频刷词（与「复习」同属学习类，紧邻放置） -->
+  <button id="learnBtn" class="ghost">词库</button>
   <button id="report" class="ghost">诊断报告</button>
   <!-- 布局切换：只在精听界面显示（文案是「点了会切到哪种布局」） -->
   <button id="layoutBtn" class="ghost" style="display:none">⇅ 上下布局</button>
@@ -2685,6 +3029,8 @@ export class PracticePanel {
 <div id="favView" class="library"></div>
 
 <div id="reviewView" class="library"></div>
+
+<div id="learnView" class="library"></div>
 
 <audio id="player" preload="auto"></audio>
 
@@ -2841,6 +3187,31 @@ let state = {
   rvRoundEnd: null,
   // 本场结束页数据（reviewEnd）
   rvEnd: null,
+  /* ---- 词库（新学单词）----
+   * 权威数据在宿主（词表 + stats/vocab.json），页面只是一个当前卡的缓存。 */
+  lwCard: null,
+  lwTotal: 0,
+  lwLearned: 0,
+  // 刷到词表末尾（learnEnd）
+  lwEnd: null,
+  // 词典不可用（learnEmpty）
+  lwEmpty: false,
+  // 当前卡是否已收藏（收藏按钮据此变禁用态）
+  lwFaved: false,
+  // 上一张卡还没回包（防连点推进游标）
+  lwBusy: false,
+  // 收藏/取消收藏的请求还在路上（回执前不允许再点，防星星闪烁）
+  lwFavBusy: false,
+  // 当前卡在词表里的下标（0 时「上一个」禁用）
+  lwIndex: 0,
+  // 「跳过已收藏/已掌握」开关（宿主记住本次值，页面负责显示）
+  lwSkipFav: true,
+  // 「跳过基础词」开关（the/of/I…；阈值在宿主的 vocabSkipBasic 配置里）
+  lwSkipBasic: true,
+  // 「自动发音」开关：出新卡自动读默认口音（持久化在 vocabAutoSpeak 配置里）
+  lwAuto: true,
+  // 「重置进度」的二次确认态
+  lwResetArmed: false,
 };
 
 // 布局偏好持久化：webview 的 state 在窗口重载、切走再回来时都会保留。
@@ -2914,7 +3285,12 @@ window.addEventListener('message', (e) => {
   if (msg.type === 'config') {
     state.showAudioDiag = !!msg.showAudioDiag;
     state.baiduConfigured = !!msg.baiduConfigured;
+    // 词库「空格」播哪个口音，跟设置项走（改了不用重载窗口）
+    lwAccent = msg.ttsAccent === 'gb' ? 'gb' : 'us';
+    // 词库自动发音开关（页面勾选会写回配置，这里随推送刷新）
+    state.lwAuto = msg.vocabAutoSpeak !== false;
     if (currentView === 'favorites') renderFavView();
+    if (currentView === 'learn') renderLearnView();
     render();
   }
   /* ---- 收藏 ---- */
@@ -3127,6 +3503,55 @@ window.addEventListener('message', (e) => {
     state.rvHeld = false;
     if (currentView === 'review') renderReviewView();
   }
+  /* ---- 词库 ---- */
+  // 一张词卡：释义/音标都由宿主从离线词典取好，页面直接画
+  if (msg.type === 'learnCard') {
+    state.lwCard = msg.card || null;
+    state.lwTotal = Number(msg.total) || 0;
+    state.lwLearned = Number(msg.learned) || 0;
+    state.lwIndex = Number(msg.index) || 0;
+    state.lwSkipFav = msg.skipFav !== false;
+    state.lwSkipBasic = msg.skipBasic !== false;
+    state.lwEnd = null;
+    state.lwEmpty = false;
+    state.lwBusy = false;
+    // 换卡即丢弃旧卡的收藏在途状态：万一回执丢了，下一张卡上的星标还能正常点
+    state.lwFavBusy = false;
+    /*
+     * 当前卡是否已收藏：从本地收藏列表算（宿主刚推过 favList）。
+     * 用词形小写比对，与 FavoriteStore 的去重键一致。
+     */
+    const lwKey = state.lwCard ? String(state.lwCard.word).toLowerCase() : '';
+    state.lwFaved = !!lwKey && state.favorites.some(
+      (f) => f.type === 'word' && String(f.text).toLowerCase() === lwKey
+    );
+    if (currentView === 'learn') renderLearnView();
+    // 自动发音：新卡到手就读默认口音（勾选开关在底部；这里只在"收到新卡"时触发，
+    // 别的渲染原因如收藏翻转/语音列表刷新不会重播）
+    if (currentView === 'learn' && state.lwAuto) ttsSpeak(lwAccent);
+  }
+  // 刷完（词表末尾）
+  if (msg.type === 'learnEnd') {
+    state.lwCard = null;
+    state.lwEnd = { total: Number(msg.total) || 0, learned: Number(msg.learned) || 0 };
+    state.lwBusy = false;
+    if (currentView === 'learn') renderLearnView();
+  }
+  // 词典不可用
+  if (msg.type === 'learnEmpty') {
+    state.lwCard = null;
+    state.lwEnd = null;
+    state.lwEmpty = true;
+    state.lwBusy = false;
+    if (currentView === 'learn') renderLearnView();
+  }
+  // 收藏回执：以宿主为准（去重命中时 id 是已有的那条）
+  if (msg.type === 'learnFavDone') {
+    // 收藏/取消收藏共用这一个回执，权威状态由宿主带回来；同时放行下一次点击
+    state.lwFaved = msg.faved !== false;
+    state.lwFavBusy = false;
+    if (currentView === 'learn') renderLearnView();
+  }
   // 注意：视图切换已在上面按 progress/done/error 的来源分别处理，
   // 不要再在这里统一 showPracticeView() —— 那会把列表里的下载进度打断。
 });
@@ -3335,8 +3760,17 @@ function renderFavView() {
     // 跳回原句的 dirName 由宿主在 favList 里动态解析（含旧数据标题兜底）
     const canJump = !!f.dirName && typeof ctx.sentenceIndex === 'number';
     const typeLabel = f.type === 'word' ? '单词' : (f.type === 'phrase' ? '短语' : '整句');
-    const sourceText = '来源：' + esc(ctx.talkTitle || '(未知课程)') +
-      ' · 句 ' + (Number(ctx.sentenceIndex) + 1);
+    /*
+     * 来源徽章：词库刷来的词没有课程/例句上下文，必须能一眼区分出来
+     * （它们出现在复习里时，用户会疑惑"我什么时候收藏的"）。
+     * 精听来源不额外加徽章 —— 来源行本身就写着 talk 标题，再加一个只会更吵。
+     */
+    const fromWordlist = f.source === 'wordlist';
+    const srcTag = fromWordlist ? '<span class="badge src-wordlist">词库</span>' : '';
+    const sourceText = fromWordlist
+      ? '来源：词库'
+      : '来源：' + esc(ctx.talkTitle || '(未知课程)') +
+        ' · 句 ' + (Number(ctx.sentenceIndex) + 1);
     // 例句播放入口（🔊）：有对应本地素材才显示
     const exPlayBtn = canJump
       ? '<button class="ex-play" data-fav-id="' + esc(f.id) + '" title="播放例句">🔊</button> '
@@ -3384,7 +3818,7 @@ function renderFavView() {
 
     return '<div class="lib-card" data-k="' + k + '" data-fav-id="' + esc(f.id) + '">' +
       '<div class="t">' + title +
-        '<span class="badge">' + typeLabel + '</span>' + rvTag +
+        '<span class="badge">' + typeLabel + '</span>' + srcTag + rvTag +
         '<button class="ghost fav-del" data-id="' + esc(f.id) + '" ' +
           'style="float:right;padding:0 6px" title="删除">✕</button>' +
       '</div>' +
@@ -3854,6 +4288,278 @@ function renderReviewView() {
   }
 }
 
+/* ---------------- 「词库」新学单词 ----------------
+ *
+ * 交互：单词 + 音标 + 释义一次全给（不翻面），按钮只有「收藏 / 下一个」。
+ * 与复习卡的区别：这不是自测，是"过一遍" —— 所以没有任何评分动作，
+ * 也不会写复习进度（要进复习体系，仍然得收藏）。
+ */
+
+const learnView = document.getElementById('learnView');
+
+/*
+ * 发音（TTS）走 webview 自带的 Web Speech API（Electron → 系统语音），
+ * 零依赖、零网络、离线可用。三个必须处理的现实问题：
+ *   1. getVoices() 在 Electron 里是【异步】的，首次经常是空数组 ——
+ *      必须监听 voiceschanged + 轮询兜底，否则按钮会永久判成"不可用"。
+ *   2. 语音由系统语言包决定：中文 Windows 常见只有 en-US（Zira/David），
+ *      没有 en-GB。缺哪个就把哪个置灰，绝不拿另一个口音冒充 ——
+ *      "英音按钮放出来的却是美音"比按钮不可用更糟。
+ *   3. 取不到任何英语语音时宁可禁用：用中文语音读英文单词，发音一定是错的。
+ */
+let ttsAll = [];
+let lwAccent = 'gb';
+let lwResetTimer = null;
+
+function ttsLang(v) {
+  return String((v && v.lang) || '').toLowerCase().replace('_', '-');
+}
+
+function ttsPick(accent) {
+  const want = accent === 'gb' ? 'en-gb' : 'en-us';
+  const exact = ttsAll.filter((v) => ttsLang(v) === want);
+  if (exact.length) return exact[0];
+  // 某些系统只把 lang 写到 "en"（没有地区）：仅在完全没有目标口音时兜底，
+  // 且必须是英语语音 —— 中文语音读英文不能算"美音/英音"。
+  const en = ttsAll.filter((v) => ttsLang(v).indexOf('en') === 0);
+  return en.length ? en[0] : null;
+}
+
+/** 只拉取语音列表，不触发渲染。返回"列表是否发生变化"（页面是纯 JS，不能写 TS 标注） */
+function ttsLoad() {
+  try {
+    if (typeof window.speechSynthesis === 'undefined') return false;
+    const list = window.speechSynthesis.getVoices() || [];
+    const changed = list.length !== ttsAll.length;
+    ttsAll = list;
+    return changed;
+  } catch (e) { return false; }
+}
+
+function ttsRefresh() {
+  const changed = ttsLoad();
+  // 只在"可用口音变了"时重渲染：否则每次轮询都会把卡片重建一次（会打断正在看的内容）
+  if (changed && currentView === 'learn') renderLearnView();
+}
+
+if (typeof window.speechSynthesis !== 'undefined') {
+  try {
+    window.speechSynthesis.addEventListener('voiceschanged', ttsRefresh);
+  } catch (e) { /* 老实现只有 onvoiceschanged，靠下面的轮询兜底 */ }
+  /*
+   * 首次枚举延到脚本末尾：ttsRefresh 里要看 currentView，
+   * 而 currentView 在本文档更下方才声明（立即调用会踩暂时性死区）。
+   */
+  setTimeout(() => {
+    ttsRefresh();
+    let ttsTries = 0;
+    const ttsTimer = setInterval(() => {
+      ttsRefresh();
+      if (ttsAll.length || ++ttsTries >= 10) clearInterval(ttsTimer);
+    }, 500);
+  }, 0);
+}
+
+function ttsSpeak(accent) {
+  const c = state.lwCard;
+  if (!c) return;
+  const v = ttsPick(accent);
+  if (!v) return;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(c.word);
+    u.voice = v;
+    u.lang = v.lang;
+    // 0.9 倍速更适合跟读；不给用户配置项（听不清可以重按，调参数只会增加决策成本）
+    u.rate = 0.9;
+    /*
+     * Chromium 冷启动会截掉首音节（已知问题）：cancel 之后隔一帧再 speak，
+     * 让引擎完成切换。30ms 人耳感觉不到，但能明显减少"缺头"。
+     */
+    setTimeout(() => {
+      try { window.speechSynthesis.speak(u); } catch (e) { /* 播放失败不影响刷词 */ }
+    }, 30);
+  } catch (e) { /* 同上 */ }
+}
+
+/** 释义按 ；与换行拆成 chip（与收藏视图同一套展示口径） */
+function lwTransHtml(text) {
+  return esc(text)
+    .split(/[；;\\n]/)
+    .map((x) => x.trim())
+    .filter((x) => x)
+    .map((x) => '<span class="chip">' + x + '</span>')
+    .join('');
+}
+
+/** 收藏开关：未收藏 → 收藏，已收藏 → 取消。放右上角星标，按错可就地反悔 */
+function lwFav() {
+  const c = state.lwCard;
+  // ⚠️ 一次点击只允许一个在途请求：连点会让乐观翻转亮→灭→亮→灭（星星闪烁），
+  //    且两张消息的顺序虽由宿主保证，闪烁本身已经很难看。等回执再放行下一次点击。
+  if (!c || state.lwFavBusy) return;
+  state.lwFavBusy = true;
+  // 乐观翻转；回执（learnFavDone）才是权威
+  state.lwFaved = !state.lwFaved;
+  renderLearnView();
+  vscode.postMessage({ type: state.lwFaved ? 'learnFav' : 'learnUnfav', word: c.word });
+}
+
+/** dir=1 下一个，dir=-1 上一个。busy = 上一张还没回包：连点/连按会重复推进游标 */
+function lwGo(dir) {
+  if (state.lwBusy || !state.lwCard) return;
+  // 第 0 张没有"上一个"（宿主也会兜底，这里省一次无效往返）
+  if (dir < 0 && state.lwIndex <= 0) return;
+  state.lwBusy = true;
+  vscode.postMessage({ type: dir < 0 ? 'learnPrev' : 'learnNext' });
+}
+
+/**
+ * 重置进度：原地二次确认（不弹窗 —— webview 里 confirm 恒返回 false）。
+ * 3 秒不点自动复原，避免"点了一次没反应、下次再来点一下就真重置了"。
+ */
+function lwResetClick() {
+  if (!state.lwResetArmed) {
+    state.lwResetArmed = true;
+    renderLearnView();
+    clearTimeout(lwResetTimer);
+    lwResetTimer = setTimeout(() => {
+      state.lwResetArmed = false;
+      if (currentView === 'learn') renderLearnView();
+    }, 3000);
+    return;
+  }
+  clearTimeout(lwResetTimer);
+  state.lwResetArmed = false;
+  state.lwEnd = null;
+  vscode.postMessage({ type: 'learnReset' });
+}
+
+function renderLearnView() {
+  if (!learnView) return;
+
+  if (state.lwEmpty) {
+    learnView.innerHTML = '<div class="center">离线词典不可用 / 没有可用词条。<br>' +
+      '<span class="hint">assets/dict.json.gz 缺失或损坏时无法刷词，重装扩展后再试。</span></div>';
+    return;
+  }
+
+  // ---- 刷完（词表末尾）----
+  if (!state.lwCard && state.lwEnd) {
+    const e = state.lwEnd;
+    learnView.innerHTML = '<div class="lw-top"><span class="lw-count">已学 ' +
+      e.learned + ' / ' + e.total + '</span></div>' +
+      '<div class="center" style="padding:18px 8px;line-height:1.9">' +
+        '<div style="font-size:14px">词库已刷完</div>' +
+        '<div class="hint">共 ' + e.total + ' 个词。重置进度可以从头再来一遍。</div>' +
+        '<div style="margin-top:14px"><button id="lwReset2">重置进度</button></div>' +
+      '</div>';
+    const r = document.getElementById('lwReset2');
+    if (r) r.onclick = () => vscode.postMessage({ type: 'learnReset' });
+    return;
+  }
+
+  const c = state.lwCard;
+  if (!c) {
+    learnView.innerHTML = '<div class="center">读取中…</div>';
+    return;
+  }
+
+  // 每次渲染前重拉一次语音列表：voiceschanged 可能没发（或发得比进入视图晚），
+  // 这里兜底能让"刚装完语音包/刚重启"的用户不刷新页面就看到按钮解锁
+  ttsLoad();
+  const usOk = !!ttsPick('us');
+  const gbOk = !!ttsPick('gb');
+  const tip = !ttsAll.length
+    ? '未检测到系统语音。若刚安装语音包，请重启 VS Code 后再试'
+    : '未检测到该口音的英语语音。若刚安装语音包，请重启 VS Code；也可运行命令「TTS 发音诊断」查看本机语音列表';
+  // ⚠️ 模板字符串里反斜杠要写两遍：单反斜杠会让生成页面里的正则退化成
+  //    /^/+|/+$/ → SyntaxError（整个 script 失效，所有按钮点不动）。
+  //    另外本段是模板字符串正文，注释里也不能出现反引号。
+  const ph = String(c.phonetic || '').replace(/^\\/+|\\/+$/g, '');
+
+  let html = '<div class="lw-top">' +
+    '<span class="lw-count">已学 ' + state.lwLearned + ' / ' + state.lwTotal + '</span>' +
+    '<span class="lw-rank">' + (c.frq ? '高频 #' + c.frq : '') + '</span>' +
+    '<button id="lwReset" class="ghost lw-reset' + (state.lwResetArmed ? ' armed' : '') + '">' +
+      (state.lwResetArmed ? '确认重置' : '重置进度') + '</button>' +
+    '</div>' +
+    '<div class="lw-card">' +
+      // 星标 = 收藏开关（右上角），已收藏显示实心星，再点一次取消
+      '<button id="lwFav" class="ghost lw-favbtn' + (state.lwFaved ? ' on' : '') + '" title="' +
+        esc(state.lwFaved ? '取消收藏（快捷键 f）' : '收藏并加入复习（快捷键 f）') + '">' +
+        (state.lwFaved ? '★' : '☆') + '</button>' +
+      '<div class="lw-word">' + esc(c.word) + '</div>' +
+      '<div class="lw-ph">' +
+        (ph ? '<span>/' + esc(ph) + '/</span>' : '') +
+        '<button id="lwGb" class="ghost"' + (gbOk ? '' : ' disabled') + ' title="' +
+          esc(gbOk ? '英音发音' : tip) + '">🔊 英</button>' +
+        '<button id="lwUs" class="ghost"' + (usOk ? '' : ' disabled') + ' title="' +
+          esc(usOk ? '美音发音' : tip) + '">🔊 美</button>' +
+      '</div>' +
+      '<div class="lw-trans">' + lwTransHtml(c.translation) + '</div>' +
+    '</div>' +
+    '<div class="lw-actions">' +
+      '<button id="lwPrev" class="ghost"' + (state.lwIndex <= 0 ? ' disabled' : '') +
+        ' title="回看上一个词（快捷键 A）">上一个</button>' +
+      '<button id="lwNext">下一个</button>' +
+    '</div>' +
+    '<div class="lw-keys"><b>A</b> 上一个　<b>D</b> 下一个　<b>空格</b> 发音　' +
+      '<b>1</b> 英音　<b>2</b> 美音　<b>f</b> 收藏/取消</div>' +
+    '<div class="lw-foot">' +
+      '<label><input type="checkbox" id="lwSkip"' + (state.lwSkipFav ? ' checked' : '') +
+        ' /> 跳过已收藏 / 已掌握</label>' +
+      '<label><input type="checkbox" id="lwSkipBasic"' + (state.lwSkipBasic ? ' checked' : '') +
+        ' title="the / of / I 这类超高频基础词不用学" /> 跳过基础词</label>' +
+      '<label><input type="checkbox" id="lwAuto"' + (state.lwAuto ? ' checked' : '') +
+        ' title="出新卡自动读默认口音（可在设置里改 listenAndWrite.vocabAutoSpeak）" /> 自动发音</label>' +
+    '</div>';
+
+  learnView.innerHTML = html;
+
+  const us = document.getElementById('lwUs');
+  if (us) us.onclick = () => ttsSpeak('us');
+  const gb = document.getElementById('lwGb');
+  if (gb) gb.onclick = () => ttsSpeak('gb');
+  const fav = document.getElementById('lwFav');
+  if (fav) fav.onclick = () => lwFav();
+  const pv = document.getElementById('lwPrev');
+  if (pv) pv.onclick = () => lwGo(-1);
+  const nx = document.getElementById('lwNext');
+  if (nx) nx.onclick = () => lwGo(1);
+  const rs = document.getElementById('lwReset');
+  if (rs) rs.onclick = () => lwResetClick();
+  const sk = document.getElementById('lwSkip');
+  if (sk) {
+    sk.onchange = () => {
+      state.lwSkipFav = !!sk.checked;
+      // 开关只管往后推进：已掠过的词不会补回来（线性刷词没有回填语义）
+      vscode.postMessage({ type: 'learnInit', skipFav: state.lwSkipFav, skipBasic: state.lwSkipBasic });
+    };
+  }
+  const skb = document.getElementById('lwSkipBasic');
+  if (skb) {
+    skb.onchange = () => {
+      state.lwSkipBasic = !!skb.checked;
+      vscode.postMessage({ type: 'learnInit', skipFav: state.lwSkipFav, skipBasic: state.lwSkipBasic });
+    };
+  }
+  const au = document.getElementById('lwAuto');
+  if (au) {
+    au.onchange = () => {
+      state.lwAuto = !!au.checked;
+      // 关掉时立刻掐掉正在读的（不然声音继续放到句尾，像没生效）
+      if (!state.lwAuto) {
+        try { window.speechSynthesis.cancel(); } catch (e) { /* 无语音环境忽略 */ }
+      } else {
+        ttsSpeak(lwAccent); // 打开时立刻示范读当前词
+      }
+      // 持久化：写回配置，重开面板/换台机器（同步设置）都记住
+      vscode.postMessage({ type: 'learnAutoPlay', on: state.lwAuto });
+    };
+  }
+}
+
 /* ---------------- 「发现 TED」浏览/搜索 ---------------- */
 
 const discView = document.getElementById('discover');
@@ -3883,7 +4589,7 @@ let discState = {
   download: {},
 };
 
-/* 视图统一切换：practice / discover / library / favorites / review / report 互斥显示 */
+/* 视图统一切换：practice / discover / library / favorites / review / learn / report 互斥显示 */
 const reportView = document.getElementById('reportView');
 const viewEls = {
   practice: document.getElementById('root'),
@@ -3891,6 +4597,7 @@ const viewEls = {
   library: libView,
   favorites: favView,
   review: reviewView,
+  learn: learnView,
   report: reportView,
 };
 let currentView = 'practice';
@@ -3903,6 +4610,7 @@ const navBtn = {
   library: document.getElementById('libraryBtn'),
   favorites: document.getElementById('favBtn'),
   review: document.getElementById('reviewBtn'),
+  learn: document.getElementById('learnBtn'),
   report: document.getElementById('report'),
 };
 
@@ -3974,6 +4682,14 @@ navBtn.review.onclick = () => {
   showView('review');
   renderReviewView();
   vscode.postMessage({ type: 'reviewListRequest' });
+};
+
+navBtn.learn.onclick = () => {
+  if (currentView === 'learn') return;
+  showView('learn');
+  renderLearnView();
+  // 每次进来都让宿主从 vocab.json 的锚词恢复：另一个实例可能已经推进过了
+  vscode.postMessage({ type: 'learnInit', skipFav: state.lwSkipFav, skipBasic: state.lwSkipBasic });
 };
 
 /* ---------------- 精听界面快捷键与播放动作 ----------------
@@ -4079,6 +4795,36 @@ document.addEventListener('keydown', (e) => {
     case 'a': rvGrade('unknown'); break;
     case 's': rvGrade('fuzzy'); break;
     case 'd': if (state.rvHeld) rvGoNext(); else rvGrade('know'); break;
+  }
+});
+
+/* ---------------- 词库界面快捷键 ----------------
+ * a = 上一个 / d = 下一个 / 空格 = 播默认口音 / 1 = 英音 / 2 = 美音 / f = 收藏
+ *
+ * ⚠️ a/d 与复习视图的 a/d 语义不同（那边是评分）——但两个视图互斥，各自的
+ *    处理器都先判 currentView，不会串。方向键 ←/→ 也映射到上/下一个，
+ *    方便记不住字母键的人。
+ * ⚠️ 空格只播"设置里的默认口音"（默认英音，见 ttsAccent 配置），不轮换：
+ *    要听另一种口音就按 1/2，每次按键结果可预期，比"按一下换一种"好记。
+ * ⚠️ 与其它视图同一套守卫：只在词库视图、不带修饰键、输入框聚焦时不抢键、
+ *    按住不放（e.repeat）不响应 —— 否则一次长按会连跳好几张卡。
+ */
+document.addEventListener('keydown', (e) => {
+  if (currentView !== 'learn') return;
+  if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  if (e.repeat) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT' || ae.tagName === 'SELECT')) {
+    return; // 正在输入，按键属于输入框
+  }
+  if (!state.lwCard) return;
+  switch (e.key) {
+    case 'a': case 'A': case 'ArrowLeft': e.preventDefault(); lwGo(-1); break;
+    case 'd': case 'D': case 'ArrowRight': case 'Enter': e.preventDefault(); lwGo(1); break;
+    case ' ': e.preventDefault(); ttsSpeak(lwAccent); break;
+    case '1': ttsSpeak('gb'); break;
+    case '2': ttsSpeak('us'); break;
+    case 'f': case 'F': lwFav(); break;
   }
 });
 

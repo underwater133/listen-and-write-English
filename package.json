@@ -2,7 +2,7 @@
   "name": "listen-and-write-english",
   "displayName": "Listen & Write 听写英语",
   "description": "Listen & Write 听写英语 —— 逐句听写 + 词级 diff 诊断，针对性提升英语听写能力。",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "Azusa",
   "repository": {
     "type": "git",
@@ -67,6 +67,10 @@
       {
         "command": "listenAndWrite.clearCache",
         "title": "Listen & Write: 清除音频缓存"
+      },
+      {
+        "command": "listenAndWrite.ttsDiagnose",
+        "title": "Listen & Write: TTS 发音诊断（检查系统语音）"
       }
     ],
     "configuration": {
@@ -151,6 +155,30 @@
           "type": "number",
           "default": 2,
           "description": "一张卡在一场复习里最多被重新排到后面几次（评「不认识」时用）。"
+        },
+        "listenAndWrite.vocabSkipBasic": {
+          "type": "number",
+          "default": 500,
+          "minimum": 0,
+          "description": "词库刷词时跳过词频排名不超过该值的超高频基础词（the / of / I 这类不用学）。设为 0 表示不过滤。勾选词库底部的「跳过基础词」时生效。"
+        },
+        "listenAndWrite.vocabAutoSpeak": {
+          "type": "boolean",
+          "default": true,
+          "description": "词库出新卡时自动朗读默认口音（跟随「默认口音」设置）。词库底部的「自动发音」勾选开关会写回此项。"
+        },
+        "listenAndWrite.ttsAccent": {
+          "type": "string",
+          "enum": [
+            "us",
+            "gb"
+          ],
+          "enumDescriptions": [
+            "美音（en-US）",
+            "英音（en-GB）"
+          ],
+          "default": "gb",
+          "description": "词库刷词时按空格播放哪个口音。卡片上的「🔊 英 / 🔊 美」按钮与快捷键 1 / 2 不受此设置影响。语音来自操作系统：系统里没装对应口音的语音包时那个按钮会置灰（可用命令「TTS 发音诊断」检查本机语音）。"
         }
       }
     }

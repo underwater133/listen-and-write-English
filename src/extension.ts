@@ -17,6 +17,7 @@ import { TedSource } from './sources/ted';
 import { MistakeRecord, SentenceResult } from './core/diff';
 import { PracticePanel } from './webview/panel';
 import { SidebarViewProvider } from './webview/sidebar';
+import { showTtsDiagnostic } from './ttsDiagnose';
 
 let cacheRoot: string;
 /** 默认素材位置（globalStorage/materials）——materialsDir 未配置时的落点，也是迁移的源 */
@@ -208,7 +209,8 @@ export function activate(context: vscode.ExtensionContext): void {
       if (
         e.affectsConfiguration('listenAndWrite.showAudioDiagnostics') ||
         e.affectsConfiguration('listenAndWrite.baiduAppId') ||
-        e.affectsConfiguration('listenAndWrite.baiduSecret')
+        e.affectsConfiguration('listenAndWrite.baiduSecret') ||
+        e.affectsConfiguration('listenAndWrite.ttsAccent')
       ) {
         // 侧边栏与编辑器面板是两个实例，都要收到（收藏视图在哪个都能看到最新状态）
         PracticePanel.current?.pushConfig();
@@ -312,6 +314,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('listenAndWrite.showReport', () => {
       PracticePanel.createOrShow(context, panelDeps);
       PracticePanel.current?.showReport();
+    }),
+
+    // TTS 发音诊断：只列出本机语音，不产物、不落盘。
+    // 「词库」的发音依赖系统语音包，出问题时靠它确认"到底有没有英语语音"。
+    vscode.commands.registerCommand('listenAndWrite.ttsDiagnose', () => {
+      showTtsDiagnostic();
     }),
 
     vscode.commands.registerCommand('listenAndWrite.clearCache', async () => {
