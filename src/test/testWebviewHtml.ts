@@ -685,21 +685,50 @@ check(
   '页面没告诉宿主看没看答案，宿主无法判断要不要停留'
 );
 check(
-  'panel.ts(复习快捷键): 空格播放例句 / w 看答案 / a 不认识 / s 模糊 / d 认识（停留态为下一个）',
+  'panel.ts(复习快捷键): 空格读单词 / 1-2 切口音 / Tab 播例句 / w 看答案 / a s d 自评（停留态为下一个）',
   /function rvGrade\(grade\)/.test(panel) &&
     /function rvReveal\(\)/.test(panel) &&
     /function rvGoNext\(\)/.test(panel) &&
     /function rvPlayExample\(\)/.test(panel) &&
+    /function rvSpeakWord\(accent\)/.test(panel) &&
     // 按钮与快捷键必须调同一套函数，否则行为会漂移
     /el\.onclick = \(\) => rvGrade\(el\.dataset\.g\)/.test(panel) &&
     /if \(rev\) rev\.onclick = \(\) => rvReveal\(\)/.test(panel) &&
     /if \(go\) go\.onclick = \(\) => rvGoNext\(\)/.test(panel) &&
-    /case ' ': e\.preventDefault\(\); rvPlayExample\(\); break;/.test(panel) &&
+    /if \(gb\) gb\.onclick = \(\) => rvSpeakWord\('gb'\)/.test(panel) &&
+    /if \(us\) us\.onclick = \(\) => rvSpeakWord\('us'\)/.test(panel) &&
+    /case ' ': e\.preventDefault\(\); rvSpeakWord\(lwAccent\); break;/.test(panel) &&
+    /case '1': rvSpeakWord\('gb'\); break;/.test(panel) &&
+    /case '2': rvSpeakWord\('us'\); break;/.test(panel) &&
+    /case 'Tab':/.test(panel) &&
+    /if \(state\.rvReveal && state\.rvCard\.canPlay\) \{ e\.preventDefault\(\); rvPlayExample\(\); \}/.test(panel) &&
     /case 'w': rvReveal\(\); break;/.test(panel) &&
     /case 'a': rvGrade\('unknown'\); break;/.test(panel) &&
     /case 's': rvGrade\('fuzzy'\); break;/.test(panel) &&
     /case 'd': if \(state\.rvHeld\) rvGoNext\(\); else rvGrade\('know'\); break;/.test(panel),
   '复习界面快捷键缺失，或与按钮各写一套逻辑'
+);
+check(
+  'panel.ts(复习卡片): 音标常驻正面（不随翻面藏起来）+ 统一 /…/ 包裹',
+  /const ph = String\(c\.phonetic \|\| ''\)\.replace\(\/\^\\\\\/\+\|\\\\\/\+\$\/g, ''\)/.test(panel) &&
+    /'<div class="rv-ph">' \+/.test(panel) &&
+    !/state\.rvReveal && c\.phonetic/.test(panel),
+  '音标仍被翻面条件挡住，或斜杠口径与词库不一致'
+);
+check(
+  'panel.ts(复习卡片): 🔊 英 / 🔊 美 与词库同款（缺口音置灰，不互相顶替）',
+  /const gbOk = !!ttsPick\('gb'\);/.test(panel) &&
+    /id="rvGb"[\s\S]{0,120}\(gbOk \? '' : ' disabled'\)/.test(panel) &&
+    /id="rvUs"[\s\S]{0,120}\(usOk \? '' : ' disabled'\)/.test(panel) &&
+    /if \(currentView === 'review'\) renderReviewView\(\);/.test(panel),
+  '复习卡发音按钮缺失、不做口音校验，或语音晚到时按钮不会自己解锁'
+);
+check(
+  'panel.ts(复习卡发音): 走与词库同一个 ttsSay（空格与按钮同一实现）',
+  /function ttsSay\(text, accent\)/.test(panel) &&
+    /function ttsSpeak\(accent\)[\s\S]{0,120}ttsSay\(c\.word, accent\)/.test(panel) &&
+    /function rvSpeakWord\(accent\)[\s\S]{0,120}ttsSay\(c\.text, accent\)/.test(panel),
+  '复习卡另写一套发音逻辑，口音/语速/冷启动补丁会与词库漂移'
 );
 check(
   'panel.ts(复习快捷键): 只在复习视图且不在输入框里抢键（首页/过场/结束页无卡时不响应）',

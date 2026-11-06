@@ -2695,7 +2695,8 @@ export class PracticePanel {
 
   /* ---- 「复习」视图（收藏单词的间隔重复）----
    * 容器复用 .library 的规则（显隐由 .visible 驱动），这里只加卡片样式。
-   * 正面只给单词，释义/例句留给翻面 —— 正面信息越少，自评越接近真实记忆。 */
+   * 正面给单词 + 音标，释义/例句留给翻面 —— 「怎么读」不算答案，可以先给；
+   * 「什么意思」才是要回忆的东西。 */
   .rv-top {
     display: flex; align-items: center; justify-content: space-between;
     font-size: 11px; color: var(--muted); flex: 0 0 auto;
@@ -2705,7 +2706,14 @@ export class PracticePanel {
     border: 1px solid var(--border); border-radius: 6px;
   }
   .rv-word { font-size: 26px; font-weight: 600; line-height: 1.3; word-break: break-word; }
-  .rv-ph { margin-top: 6px; font-size: 12px; color: var(--muted); }
+  /* 音标常驻（不随翻面出现）+ 两个口音按钮，与词库卡同一套发音入口 */
+  .rv-ph {
+    margin-top: 8px; font-size: 13px; color: var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    gap: 6px; flex-wrap: wrap;
+  }
+  .rv-ph button { padding: 0 6px; font-size: 11px; line-height: 1.6; }
+  .rv-ph button:disabled { opacity: .45; cursor: default; }
   .rv-trans { font-size: 13px; line-height: 1.6; margin-bottom: 6px; }
   .rv-sent { font-size: 12px; line-height: 1.6; margin-top: 4px; }
   .rv-actions { flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -4040,10 +4048,12 @@ function rvDueText(dueAt) {
  * ⚠️ 「认识」用实心按钮（主操作），模糊/不认识用描边 —— 避免用户顺手点第一个。
  *
  * 快捷键说明（.rv-keys）紧跟按钮行下方，小字；
- * ⚠️ 空格只在【这张卡真的有例句音频】时才写进说明（canPlay）——
- *    没音频还提示「空格播放」，用户按了没反应会以为快捷键坏了。
+ * ⚠️ 只列主路径的键。「1」/「2」切口音、「Tab」播例句属于进阶操作，
+ *    挂在按钮 title 上即可 —— 六组键挤一行会折成两行，反而没人看。
+ * ⚠️ 空格只在【本机真有英语语音】时才写进说明（canSpeak）——
+ *    没语音还提示「空格发音」，用户按了没声音会以为快捷键坏了。
  */
-function rvActions(withReveal, canPlay) {
+function rvActions(withReveal, canSpeak) {
   let h = '';
   if (withReveal) {
     h += '<div class="rv-actions"><button id="rvReveal" class="ghost">看答案</button></div>';
@@ -4055,7 +4065,7 @@ function rvActions(withReveal, canPlay) {
     '</div>';
   // 说明只列「此刻真的能用」的键：w 只在还没翻面时可用（翻面后按钮就收起了）
   h += '<div class="rv-keys">' +
-    (canPlay ? '<b>空格</b> 播放例句　' : '') +
+    (canSpeak ? '<b>空格</b> 发音　' : '') +
     (withReveal ? '<b>w</b> 看答案　' : '') +
     '<b>a</b> 不认识　<b>s</b> 模糊　<b>d</b> 认识' +
     '</div>';
@@ -4165,19 +4175,41 @@ function renderReviewView() {
   // ---- 3) 卡片 ----
   if (state.rvCard) {
     const c = state.rvCard;
+    /*
+     * 发音入口与音标一起常驻卡片正面 —— 音标回答的是「怎么读」，不是「什么意思」，
+     * 不该跟着答案一起被翻面藏起来。
+     * 口音按钮按【本机语音】置灰，与词库卡同一套规则（缺 en-GB 就灰着，
+     * 绝不拿 en-US 冒充英音）。每次渲染前重拉一次语音列表：voiceschanged
+     * 可能发得比进视图还晚，不重拉会让刚装完语音包的按钮一直是灰的。
+     */
+    ttsLoad();
+    const gbOk = !!ttsPick('gb');
+    const usOk = !!ttsPick('us');
+    const canSpeak = gbOk || usOk;
+    const speakTip = !ttsAll.length
+      ? '未检测到系统语音。若刚安装语音包，请重启 VS Code 后再试'
+      : '未检测到该口音的英语语音。若刚安装语音包，请重启 VS Code；也可运行命令「TTS 发音诊断」查看本机语音列表';
+    // 音标口径与词库一致：收藏里存的有的带斜杠有的不带，统一包一层
+    const ph = String(c.phonetic || '').replace(/^\\/+|\\/+$/g, '');
     html = '<div class="rv-top">' +
       '<span>第 ' + (state.rvRound + 1) + ' 轮 · ' + (state.rvIndex + 1) + ' / ' + state.rvTotal + '</span>' +
       '<span>' + (c.isNew ? '新词' : '第 ' + (c.level + 1) + ' 档') + '</span>' +
       '</div>' +
       '<div class="rv-card"><div class="rv-word">' + esc(c.text) + '</div>' +
-        (state.rvReveal && c.phonetic ? '<div class="rv-ph">' + esc(c.phonetic) + '</div>' : '') +
+        '<div class="rv-ph">' +
+          (ph ? '<span>/' + esc(ph) + '/</span>' : '') +
+          '<button id="rvGb" class="ghost"' + (gbOk ? '' : ' disabled') + ' title="' +
+            esc(gbOk ? '英音发音（快捷键 1）' : speakTip) + '">🔊 英</button>' +
+          '<button id="rvUs" class="ghost"' + (usOk ? '' : ' disabled') + ' title="' +
+            esc(usOk ? '美音发音（快捷键 2）' : speakTip) + '">🔊 美</button>' +
+        '</div>' +
       '</div>';
 
     if (state.rvReveal) {
       // ⚠️ 🔊 必须紧贴它朗读的那句例句。原先挂在「来源」行上，视觉上像是播演讲标题
       const playBtn = c.canPlay
         ? '<button id="rvPlay" class="ghost" style="padding:0 5px;margin-right:4px" ' +
-          'title="播放这句例句的音频">🔊</button>'
+          'title="播放这句例句的音频（快捷键 Tab）">🔊</button>'
         : '';
       html += '<div class="answer">' +
         (c.translation
@@ -4211,14 +4243,14 @@ function renderReviewView() {
       }
       html += '<div class="rv-actions"><button id="rvGo">' +
         (isLast ? '完成' : '下一个') + '</button></div>';
-      // 停留态只有 d 一个可用的键（空格照旧能重听例句）——
+      // 停留态只剩 d 一个主路径键（空格照旧能再听一遍单词、Tab 能播例句）——
       // 这里不列自评键：那三个按钮此时是收起来的，列出来只会让人去按
       html += '<div class="rv-keys">' +
-        (c.canPlay ? '<b>空格</b> 播放例句　' : '') +
+        (canSpeak ? '<b>空格</b> 发音　' : '') +
         '<b>d</b> ' + (isLast ? '完成' : '下一个') +
         '</div>';
     } else {
-      html += rvActions(!state.rvReveal, !!c.canPlay);
+      html += rvActions(!state.rvReveal, canSpeak);
     }
     reviewView.innerHTML = html;
 
@@ -4233,6 +4265,11 @@ function renderReviewView() {
     if (rt) rt.onclick = () => vscode.postMessage({ type: 'favRetry' });
     const pl = document.getElementById('rvPlay');
     if (pl) pl.onclick = () => rvPlayExample();
+    // 单词发音：按钮与快捷键走同一个函数（与词库的做法一致），行为不会漂移
+    const gb = document.getElementById('rvGb');
+    if (gb) gb.onclick = () => rvSpeakWord('gb');
+    const us = document.getElementById('rvUs');
+    if (us) us.onclick = () => rvSpeakWord('us');
     return;
   }
 
@@ -4339,7 +4376,11 @@ function ttsLoad() {
 function ttsRefresh() {
   const changed = ttsLoad();
   // 只在"可用口音变了"时重渲染：否则每次轮询都会把卡片重建一次（会打断正在看的内容）
-  if (changed && currentView === 'learn') renderLearnView();
+  if (!changed) return;
+  if (currentView === 'learn') renderLearnView();
+  // 复习卡的 🔊 按钮也按语音列表置灰：语音晚到时要让它自己解锁，
+  // 不能让用户为了听一个词去切视图再切回来
+  else if (currentView === 'review') renderReviewView();
 }
 
 if (typeof window.speechSynthesis !== 'undefined') {
@@ -4360,14 +4401,17 @@ if (typeof window.speechSynthesis !== 'undefined') {
   }, 0);
 }
 
-function ttsSpeak(accent) {
-  const c = state.lwCard;
-  if (!c) return;
+/**
+ * 朗读一段文本（词库卡与复习卡共用）。
+ * 拿不到对应口音就【不出声】—— 调用方此时已经把按钮置灰了，正常路径走不到这。
+ */
+function ttsSay(text, accent) {
+  if (!text) return;
   const v = ttsPick(accent);
   if (!v) return;
   try {
     window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(c.word);
+    const u = new SpeechSynthesisUtterance(text);
     u.voice = v;
     u.lang = v.lang;
     // 0.9 倍速更适合跟读；不给用户配置项（听不清可以重按，调参数只会增加决策成本）
@@ -4380,6 +4424,20 @@ function ttsSpeak(accent) {
       try { window.speechSynthesis.speak(u); } catch (e) { /* 播放失败不影响刷词 */ }
     }, 30);
   } catch (e) { /* 同上 */ }
+}
+
+/** 词库卡：读当前词 */
+function ttsSpeak(accent) {
+  const c = state.lwCard;
+  if (!c) return;
+  ttsSay(c.word, accent);
+}
+
+/** 复习卡：读当前词（空格与 🔊 按钮都走这里） */
+function rvSpeakWord(accent) {
+  const c = state.rvCard;
+  if (!c) return;
+  ttsSay(c.text, accent);
 }
 
 /** 释义按 ；与换行拆成 chip（与收藏视图同一套展示口径） */
@@ -4769,8 +4827,12 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ---------------- 复习界面快捷键 ----------------
- * 空格 = 播放例句音频 / w = 看答案 / a = 不认识 / s = 模糊 / d = 认识（停留态里是「下一个」）
+ * 空格 = 读单词 / 1 = 英音 / 2 = 美音 / Tab = 播例句 / w = 看答案 /
+ * a = 不认识 / s = 模糊 / d = 认识（停留态里是「下一个」）
  *
+ * ⚠️ 空格读【单词】而不是例句：复习卡正面的任务是「回忆这个词」，
+ *    例句里就含这个词，正面播例句等于把答案念出来；而「再听一遍单词」
+ *    本来就是自测时最自然的动作。Tab 播例句只在翻面后生效（同理）。
  * ⚠️ d 一键两义是刻意的：自评时它是「认识」，停留态（已评分、等你看答案）里
  *    自评按钮已经收起、屏幕上只剩「下一个 / 完成」那一个按钮，不存在歧义 ——
  *    于是「a 不认识 → 看一眼答案 → d 继续」可以一路盲打，手不用离开键盘。
@@ -4790,7 +4852,14 @@ document.addEventListener('keydown', (e) => {
   }
   if (!state.rvCard) return;
   switch (e.key) {
-    case ' ': e.preventDefault(); rvPlayExample(); break;
+    case ' ': e.preventDefault(); rvSpeakWord(lwAccent); break;
+    case '1': rvSpeakWord('gb'); break;
+    case '2': rvSpeakWord('us'); break;
+    case 'Tab':
+      // 只在翻面后播例句；不 preventDefault 就会把焦点搬到别的按钮上，
+      // 之后空格/回车的行为都跟着变（自评按钮被回车误触发）
+      if (state.rvReveal && state.rvCard.canPlay) { e.preventDefault(); rvPlayExample(); }
+      break;
     case 'w': rvReveal(); break;
     case 'a': rvGrade('unknown'); break;
     case 's': rvGrade('fuzzy'); break;
